@@ -1,0 +1,55 @@
+# Unity generated directories
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# IDE and editor generated files
+.vs/
+.idea/
+.vscode/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Android and Gradle generated files
+.gradle/
+local.properties
+key.properties
+*.apk
+*.aab
+
+# Signing keys must never be committed
+*.keystore
+*.jks
+
+# Unity crash reports and profiler captures
+sysinfo.txt
+*.stackdump
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary and backup files
+*~
+*.bak
+*.orig
+

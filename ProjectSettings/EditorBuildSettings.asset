@@ -1,0 +1,10 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1045 &1
+EditorBuildSettings:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Scenes: []
+  m_configObjects:
+    ByteDance.PICO.XR.Settings: {fileID: 11400000, guid: 7412d232f24efa54994a0538a0336176, type: 2}
+    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 4312b0f9f6b9e4446bb6d4985e0255bb, type: 2}

@@ -287,8 +287,9 @@ public class CameraFrameViewer : MonoBehaviour
             yield break;
         }
 
-        // 局域网直连等待 ICE 候选收集（最多 1.0 秒）
-        float iceDeadline = Time.realtimeSinceStartup + 1.0f;
+        // 局域网直连等待 ICE 候选收集（最多 3.5 秒）
+        // 需要给足时间让所有 host candidate 收集完毕，否则 Offer SDP 不完整导致对端 ICE 永远 checking
+        float iceDeadline = Time.realtimeSinceStartup + 3.5f;
         while (peerConnection != null &&
                peerConnection.GatheringState != RTCIceGatheringState.Complete &&
                Time.realtimeSinceStartup < iceDeadline)

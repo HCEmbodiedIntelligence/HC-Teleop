@@ -251,18 +251,21 @@ public class CameraFrameViewer : MonoBehaviour
         RTCRtpTransceiver transceiver =
             peerConnection.AddTransceiver(TrackKind.Video, init);
 
-        RTCRtpCodecCapability[] h264Codecs =
+        // 优先支持 H.264，同时保留 VP8 作为安全后备
+        RTCRtpCodecCapability[] preferredCodecs =
             RTCRtpSender.GetCapabilities(TrackKind.Video).codecs
                 .Where(codec =>
-                    string.Equals(codec.mimeType, "video/H264", StringComparison.OrdinalIgnoreCase))
+                    string.Equals(codec.mimeType, "video/H264", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(codec.mimeType, "video/VP8", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(codec => string.Equals(codec.mimeType, "video/H264", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
                 .ToArray();
 
-        if (h264Codecs.Length > 0)
+        if (preferredCodecs.Length > 0)
         {
-            RTCErrorType codecError = transceiver.SetCodecPreferences(h264Codecs);
+            RTCErrorType codecError = transceiver.SetCodecPreferences(preferredCodecs);
             if (codecError != RTCErrorType.None)
             {
-                Debug.LogWarning("设置 H.264 首选项提示: " + codecError);
+                Debug.LogWarning("设置视频首选编解码器提示: " + codecError);
             }
         }
 
@@ -284,11 +287,10 @@ public class CameraFrameViewer : MonoBehaviour
             yield break;
         }
 
-        // 局域网直连快速收集候选（最多等待 0.35 秒或首次出现 candidate 即发送）
-        float iceDeadline = Time.realtimeSinceStartup + 0.35f;
+        // 局域网直连等待 ICE 候选收集（最多 1.0 秒）
+        float iceDeadline = Time.realtimeSinceStartup + 1.0f;
         while (peerConnection != null &&
                peerConnection.GatheringState != RTCIceGatheringState.Complete &&
-               !peerConnection.LocalDescription.sdp.Contains("a=candidate") &&
                Time.realtimeSinceStartup < iceDeadline)
         {
             yield return null;
@@ -305,77 +307,60 @@ public class CameraFrameViewer : MonoBehaviour
         };
 
         byte[] body = Encoding.UTF8.GetBytes(JsonUtility.ToJson(offerJson));
-        int[] portsToTry = (videoPort > 0) ? new int[] { videoPort, 7876 } : new int[] { 7876 };
-        string[] pathsToTry = new string[] { offerPath, "/offer", "/api/webrtc/offer" };
+        int targetPort = (videoPort > 0) ? videoPort : 7876;
+        string normPath = string.IsNullOrEmpty(offerPath) ? "/offer" : (offerPath.StartsWith("/") ? offerPath : "/" + offerPath);
+        string url = "http://" + serverIp + ":" + targetPort + normPath;
 
-        bool success = false;
         string lastHttpError = string.Empty;
+        SessionDescriptionJson answerJson = null;
 
-        foreach (int port in portsToTry.Distinct())
+        using (var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST))
         {
-            foreach (string path in pathsToTry.Distinct())
+            request.uploadHandler = new UploadHandlerRaw(body);
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.timeout = 5;
+            yield return request.SendWebRequest();
+
+            if (request.result != UnityWebRequest.Result.Success)
             {
-                string normPath = path.StartsWith("/") ? path : "/" + path;
-                string url = "http://" + serverIp + ":" + port + normPath;
-                using (var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST))
-                {
-                    request.uploadHandler = new UploadHandlerRaw(body);
-                    request.downloadHandler = new DownloadHandlerBuffer();
-                    request.SetRequestHeader("Content-Type", "application/json");
-                    request.timeout = 6;
-                    yield return request.SendWebRequest();
-
-                    if (request.result != UnityWebRequest.Result.Success)
-                    {
-                        string bodyText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
-                        lastHttpError = !string.IsNullOrEmpty(bodyText)
-                            ? request.error + " (" + bodyText.Trim() + ")"
-                            : request.error + " (端口: " + port + ")";
-                        continue;
-                    }
-
-                    SessionDescriptionJson answerJson = null;
-                    try
-                    {
-                        answerJson = JsonUtility.FromJson<SessionDescriptionJson>(request.downloadHandler.text);
-                    }
-                    catch (Exception exception)
-                    {
-                        lastHttpError = "JSON解析错误: " + exception.Message;
-                        continue;
-                    }
-
-                    if (answerJson == null || string.IsNullOrEmpty(answerJson.sdp))
-                    {
-                        lastHttpError = "电脑端未返回有效 SDP";
-                        continue;
-                    }
-
-                    var answer = new RTCSessionDescription
-                    {
-                        type = RTCSdpType.Answer,
-                        sdp = answerJson.sdp
-                    };
-
-                    RTCSetSessionDescriptionAsyncOperation remoteOperation =
-                        peerConnection.SetRemoteDescription(ref answer);
-                    yield return remoteOperation;
-                    if (remoteOperation.IsError)
-                    {
-                        FailConnection("设置远端 SDP 失败: " + remoteOperation.Error.message);
-                        yield break;
-                    }
-
-                    success = true;
-                    break;
-                }
+                string bodyText = request.downloadHandler != null ? request.downloadHandler.text : string.Empty;
+                lastHttpError = !string.IsNullOrEmpty(bodyText)
+                    ? request.error + " (" + bodyText.Trim() + ")"
+                    : request.error + " (URL: " + url + ")";
+                FailConnection("信令请求失败: " + lastHttpError);
+                yield break;
             }
-            if (success) break;
+
+            try
+            {
+                answerJson = JsonUtility.FromJson<SessionDescriptionJson>(request.downloadHandler.text);
+            }
+            catch (Exception exception)
+            {
+                FailConnection("JSON解析错误: " + exception.Message);
+                yield break;
+            }
         }
 
-        if (!success)
+        if (answerJson == null || string.IsNullOrEmpty(answerJson.sdp))
         {
-            FailConnection("信令失败: " + lastHttpError);
+            FailConnection("机器人未返回有效 SDP Answer");
+            yield break;
+        }
+
+        var answer = new RTCSessionDescription
+        {
+            type = RTCSdpType.Answer,
+            sdp = answerJson.sdp
+        };
+
+        RTCSetSessionDescriptionAsyncOperation remoteOperation =
+            peerConnection.SetRemoteDescription(ref answer);
+        yield return remoteOperation;
+        if (remoteOperation.IsError)
+        {
+            FailConnection("设置远端 SDP 失败: " + remoteOperation.Error.message);
             yield break;
         }
 
@@ -657,8 +642,7 @@ public class CameraFrameViewer : MonoBehaviour
             connectionState = "ICE: " + state;
         }
 
-        if (state == RTCIceConnectionState.Failed ||
-            state == RTCIceConnectionState.Closed)
+        if (state == RTCIceConnectionState.Failed)
         {
             connectionNeedsRestart = true;
         }
@@ -671,8 +655,7 @@ public class CameraFrameViewer : MonoBehaviour
             connectionState = "已连接 H.264";
             lastError = string.Empty;
         }
-        else if (state == RTCPeerConnectionState.Failed ||
-                 state == RTCPeerConnectionState.Closed)
+        else if (state == RTCPeerConnectionState.Failed)
         {
             connectionNeedsRestart = true;
         }

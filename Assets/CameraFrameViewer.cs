@@ -64,9 +64,8 @@ public class CameraFrameViewer : MonoBehaviour
 
     public float DisplayedVideoFps => displayedVideoFps;
     public bool IsVideoConnected =>
-        receivedVideoTrack != null &&
-        (Time.realtimeSinceStartup - lastFrameRealtime < 10f ||
-         (peerConnection != null && (peerConnection.IceConnectionState == RTCIceConnectionState.Connected || peerConnection.IceConnectionState == RTCIceConnectionState.Completed)));
+        (receivedVideoTrack != null || (targetImage != null && targetImage.texture != null)) &&
+        (Time.realtimeSinceStartup - lastFrameRealtime < 6f);
     public bool IsWindowVisible => isWindowVisible;
 
     public string CompactStatus
@@ -135,11 +134,12 @@ public class CameraFrameViewer : MonoBehaviour
         }
     }
 
+    private float fpsCalcTimer = 0f;
+
     private void OnEnable()
     {
         webRtcUpdateCoroutine = StartCoroutine(WebRTC.Update());
         connectionCoroutine = StartCoroutine(ConnectionLoop());
-        statsCoroutine = StartCoroutine(VideoStatsLoop());
     }
 
     private void OnDisable()
@@ -148,33 +148,26 @@ public class CameraFrameViewer : MonoBehaviour
             StopCoroutine(connectionCoroutine);
         if (webRtcUpdateCoroutine != null)
             StopCoroutine(webRtcUpdateCoroutine);
-        if (statsCoroutine != null)
-            StopCoroutine(statsCoroutine);
 
         connectionCoroutine = null;
         webRtcUpdateCoroutine = null;
-        statsCoroutine = null;
         ClosePeerConnection(true);
     }
 
     private void Update()
     {
-        statusRefreshTimer += Time.unscaledDeltaTime;
-
-        // 仅在已建立视频轨道且完全无任何数据 15 秒以上，且 ICE 已失败时才触发重连
-        if (receivedVideoTrack != null &&
-            lastFrameRealtime > 0f &&
-            Time.realtimeSinceStartup - lastFrameRealtime > 15f)
+        fpsCalcTimer += Time.unscaledDeltaTime;
+        if (fpsCalcTimer >= 1.0f)
         {
-            if (peerConnection == null ||
-                peerConnection.IceConnectionState == RTCIceConnectionState.Failed ||
-                peerConnection.IceConnectionState == RTCIceConnectionState.Closed)
+            if (fpsCalcTimer > 0f)
             {
-                connectionState = "视频流中断，正在重连";
-                connectionNeedsRestart = true;
+                displayedVideoFps = receivedFramesCount / fpsCalcTimer;
+                receivedFramesCount = 0;
             }
+            fpsCalcTimer = 0f;
         }
 
+        statusRefreshTimer += Time.unscaledDeltaTime;
         if (statusRefreshTimer >= 0.25f)
         {
             statusRefreshTimer = 0f;
@@ -194,19 +187,18 @@ public class CameraFrameViewer : MonoBehaviour
             }
 
             string discoveredIp = poseSender.ReceiverIpAddress;
-
-            // 当发现有效 IP 时，记录并更新
             if (!string.IsNullOrEmpty(discoveredIp))
             {
-                if (currentServerIp != discoveredIp)
+                if (string.IsNullOrEmpty(currentServerIp))
                 {
-                    ClosePeerConnection(false);
                     currentServerIp = discoveredIp;
-                    connectionNeedsRestart = false;
+                }
+                else if (currentServerIp != discoveredIp && peerConnection == null)
+                {
+                    currentServerIp = discoveredIp;
                 }
             }
 
-            // 若从未发现过任何 PC IP，进入等待发现状态
             if (string.IsNullOrEmpty(currentServerIp))
             {
                 connectionState = "等待发现 PC";
@@ -214,29 +206,29 @@ public class CameraFrameViewer : MonoBehaviour
                 continue;
             }
 
-            // 如果当前已有连接且不需要重启，保持常驻检测
-            if (peerConnection != null && !connectionNeedsRestart)
+            // 如果当前连接正常（或正在稳定接收画面），绝对不要主动断开！
+            if (peerConnection != null)
             {
-                yield return new WaitForSecondsRealtime(0.5f);
-                continue;
-            }
+                if (!connectionNeedsRestart)
+                {
+                    yield return new WaitForSecondsRealtime(1.0f);
+                    continue;
+                }
 
-            // 重启连接前清理（保留当前最后一帧，避免白屏闪烁）
-            if (connectionNeedsRestart && peerConnection != null)
-            {
+                // 仅在明确出错需要重试时清理旧连接
                 ClosePeerConnection(false);
                 connectionNeedsRestart = false;
             }
 
-            if (peerConnection == null)
+            yield return StartCoroutine(ConnectToServer(currentServerIp));
+
+            if (peerConnection == null || connectionNeedsRestart)
             {
-                yield return StartCoroutine(ConnectToServer(currentServerIp));
-                if (peerConnection == null || connectionNeedsRestart)
-                    yield return new WaitForSecondsRealtime(reconnectDelaySeconds);
+                yield return new WaitForSecondsRealtime(reconnectDelaySeconds);
             }
             else
             {
-                yield return new WaitForSecondsRealtime(0.25f);
+                yield return new WaitForSecondsRealtime(1.0f);
             }
         }
     }

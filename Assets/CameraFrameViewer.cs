@@ -320,7 +320,9 @@ public class CameraFrameViewer : MonoBehaviour
             request.uploadHandler = new UploadHandlerRaw(body);
             request.downloadHandler = new DownloadHandlerBuffer();
             request.SetRequestHeader("Content-Type", "application/json");
-            request.timeout = 5;
+            // 给服务端 ICE gathering（最多 2s）+ 网络往返留足余量
+            // 必须 > 服务端 ICE gather 上限（2s）+ Answer 序列化/传输时间
+            request.timeout = 12;
             yield return request.SendWebRequest();
 
             if (request.result != UnityWebRequest.Result.Success)

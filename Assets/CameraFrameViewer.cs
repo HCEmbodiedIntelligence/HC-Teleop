@@ -292,10 +292,11 @@ public class CameraFrameViewer : MonoBehaviour
             yield break;
         }
 
-        // 局域网无 Trickle ICE，等待收集完成或超时 3 秒
-        float iceDeadline = Time.realtimeSinceStartup + 3f;
+        // 局域网直连快速收集候选（最多等待 0.35 秒或首次出现 candidate 即发送）
+        float iceDeadline = Time.realtimeSinceStartup + 0.35f;
         while (peerConnection != null &&
                peerConnection.GatheringState != RTCIceGatheringState.Complete &&
+               !peerConnection.LocalDescription.sdp.Contains("a=candidate") &&
                Time.realtimeSinceStartup < iceDeadline)
         {
             yield return null;

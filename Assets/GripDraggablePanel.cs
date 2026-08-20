@@ -21,21 +21,55 @@ public class GripDraggablePanel : MonoBehaviour
     private static readonly List<GripDraggablePanel> registeredPanels =
         new List<GripDraggablePanel>();
     private static int lastDepthSortFrame = -1;
+    private static UdpPoseSender cachedPoseSender;
+
+    public static bool IsTeleopActive()
+    {
+        if (cachedPoseSender == null)
+            cachedPoseSender = FindObjectOfType<UdpPoseSender>(true);
+        return cachedPoseSender != null && cachedPoseSender.IsTransmissionEnabled;
+    }
+
+    public static void EndAllDrags()
+    {
+        activePanel = null;
+        lastInteractedPanel = null;
+        foreach (GripDraggablePanel p in registeredPanels)
+        {
+            if (p != null)
+                p.EndDrag();
+        }
+    }
 
     private RectTransform panel;
     private Transform draggingController;
     private XRNode draggingNode;
     private float dragDistance;
     private Vector3 grabOffset;
+    private bool wasLeftGripPressed;
+    private bool wasRightGripPressed;
+    private Vector3 initialLocalPosition;
+    private Quaternion initialLocalRotation;
+    private Vector3 initialLocalScale;
+    private bool hasInitialPose;
 
     private void Awake()
     {
         panel = GetComponent<RectTransform>();
+        initialLocalPosition = panel.localPosition;
+        initialLocalRotation = panel.localRotation;
+        initialLocalScale = panel.localScale;
+        hasInitialPose = true;
         FindHeadIfNeeded();
     }
 
     private void OnEnable()
     {
+        // Synchronize the current state so a grip that was pressed outside
+        // the panel cannot become a new press when this panel is enabled.
+        wasLeftGripPressed = IsGripPressed(XRNode.LeftHand);
+        wasRightGripPressed = IsGripPressed(XRNode.RightHand);
+
         if (!registeredPanels.Contains(this))
             registeredPanels.Add(this);
     }
@@ -44,9 +78,33 @@ public class GripDraggablePanel : MonoBehaviour
     {
         FindHeadIfNeeded();
 
+        // 开启遥操作后彻底禁止拖动画面与面板
+        if (IsTeleopActive())
+        {
+            if (draggingController != null || activePanel == this)
+            {
+                EndDrag();
+            }
+            return;
+        }
+
+        bool leftGripPressed = IsGripPressed(XRNode.LeftHand);
+        bool rightGripPressed = IsGripPressed(XRNode.RightHand);
+        bool leftGripPressedThisFrame =
+            leftGripPressed && !wasLeftGripPressed;
+        bool rightGripPressedThisFrame =
+            rightGripPressed && !wasRightGripPressed;
+
+        wasLeftGripPressed = leftGripPressed;
+        wasRightGripPressed = rightGripPressed;
+
         if (draggingController != null)
         {
-            if (!IsGripPressed(draggingNode))
+            bool draggingGripPressed = draggingNode == XRNode.LeftHand
+                ? leftGripPressed
+                : rightGripPressed;
+
+            if (!draggingGripPressed)
             {
                 EndDrag();
                 return;
@@ -59,13 +117,16 @@ public class GripDraggablePanel : MonoBehaviour
         if (activePanel != null)
             return;
 
-        if (IsGripPressed(XRNode.LeftHand) &&
+        // A drag may only begin on the rising edge while the ray is already
+        // inside the closest visible panel. Holding outside and moving onto a
+        // panel intentionally does not begin a drag.
+        if (leftGripPressedThisFrame &&
             TryBeginDrag(leftController, XRNode.LeftHand))
         {
             return;
         }
 
-        if (IsGripPressed(XRNode.RightHand))
+        if (rightGripPressedThisFrame)
             TryBeginDrag(rightController, XRNode.RightHand);
     }
 
@@ -86,7 +147,7 @@ public class GripDraggablePanel : MonoBehaviour
 
     private bool TryBeginDrag(Transform controller, XRNode node)
     {
-        if (controller == null || head == null)
+        if (IsTeleopActive() || controller == null || head == null)
             return false;
 
         if (!TryGetClosestPanelHit(
@@ -242,6 +303,148 @@ public class GripDraggablePanel : MonoBehaviour
             activePanel = null;
     }
 
+    public void ResetToInitialPose()
+    {
+        EndDrag();
+
+        if (panel == null)
+            panel = GetComponent<RectTransform>();
+
+        // An inactive scene object may not have received Awake yet. In that
+        // case its current serialized transform is already its reset pose.
+        if (!hasInitialPose)
+        {
+            initialLocalPosition = panel.localPosition;
+            initialLocalRotation = panel.localRotation;
+            initialLocalScale = panel.localScale;
+            hasInitialPose = true;
+            return;
+        }
+
+        panel.localPosition = initialLocalPosition;
+        panel.localRotation = initialLocalRotation;
+        panel.localScale = initialLocalScale;
+        lastInteractedPanel = null;
+    }
+
+    public static int ResetAllPanels()
+    {
+        GripDraggablePanel[] panels =
+            FindObjectsOfType<GripDraggablePanel>(true);
+
+        activePanel = null;
+        lastInteractedPanel = null;
+
+        var validPanels = new List<GripDraggablePanel>();
+        foreach (GripDraggablePanel item in panels)
+        {
+            if (item != null)
+            {
+                item.EndDrag();
+                if (item.panel == null)
+                    item.panel = item.GetComponent<RectTransform>();
+                validPanels.Add(item);
+            }
+        }
+
+        if (validPanels.Count == 0)
+            return 0;
+
+        // Prefer a predictable left-to-right order when the two main windows
+        // are brought back into view.
+        validPanels.Sort((a, b) =>
+        {
+            int aOrder = GetResetOrder(a.name);
+            int bOrder = GetResetOrder(b.name);
+            return aOrder != bOrder
+                ? aOrder.CompareTo(bOrder)
+                : string.CompareOrdinal(a.name, b.name);
+        });
+
+        RectTransform sharedParent = validPanels[0].panel.parent as RectTransform;
+        bool sameParent = sharedParent != null;
+        foreach (GripDraggablePanel item in validPanels)
+            sameParent &= item.panel.parent == sharedParent;
+
+        if (sameParent)
+            ArrangeOnSharedCanvas(validPanels, sharedParent);
+        else
+            ArrangeInWorld(validPanels);
+
+        return validPanels.Count;
+    }
+
+    private static int GetResetOrder(string objectName)
+    {
+        if (objectName.IndexOf("Network", System.StringComparison.OrdinalIgnoreCase) >= 0)
+            return 0;
+        if (objectName.IndexOf("Video", System.StringComparison.OrdinalIgnoreCase) >= 0)
+            return 1;
+        return 2;
+    }
+
+    private static void ArrangeOnSharedCanvas(
+        List<GripDraggablePanel> panels,
+        RectTransform parent)
+    {
+        const float gap = 64f;
+        const float horizontalMargin = 100f;
+        const float verticalMargin = 80f;
+
+        float rawWidth = gap * Mathf.Max(0, panels.Count - 1);
+        float rawMaxHeight = 0f;
+        foreach (GripDraggablePanel item in panels)
+        {
+            rawWidth += Mathf.Max(1f, item.panel.rect.width);
+            rawMaxHeight = Mathf.Max(rawMaxHeight, item.panel.rect.height);
+        }
+
+        float availableWidth = Mathf.Max(400f, parent.rect.width - horizontalMargin);
+        float availableHeight = Mathf.Max(300f, parent.rect.height - verticalMargin);
+        float fitScale = Mathf.Min(
+            1f,
+            availableWidth / Mathf.Max(1f, rawWidth),
+            availableHeight / Mathf.Max(1f, rawMaxHeight));
+
+        float fittedTotalWidth = rawWidth * fitScale;
+        float cursor = -fittedTotalWidth * 0.5f;
+
+        foreach (GripDraggablePanel item in panels)
+        {
+            float fittedWidth = item.panel.rect.width * fitScale;
+            item.panel.localRotation = Quaternion.identity;
+            item.panel.localScale = Vector3.one * fitScale;
+            item.panel.anchoredPosition = new Vector2(
+                cursor + fittedWidth * 0.5f,
+                0f);
+            cursor += fittedWidth + gap * fitScale;
+        }
+    }
+
+    private static void ArrangeInWorld(List<GripDraggablePanel> panels)
+    {
+        Transform view = Camera.main != null ? Camera.main.transform : null;
+        if (view == null)
+        {
+            foreach (GripDraggablePanel item in panels)
+                item.ResetToInitialPose();
+            return;
+        }
+
+        float spacing = 0.72f;
+        float start = -spacing * (panels.Count - 1) * 0.5f;
+        Vector3 center = view.position + view.forward * 1.5f;
+
+        for (int index = 0; index < panels.Count; index++)
+        {
+            RectTransform rect = panels[index].panel;
+            rect.position = center + view.right * (start + spacing * index);
+            rect.rotation = Quaternion.LookRotation(
+                rect.position - view.position,
+                Vector3.up);
+        }
+    }
+
     private static void SortPanelsByDistance()
     {
         registeredPanels.RemoveAll(item => item == null);
@@ -283,6 +486,8 @@ public class GripDraggablePanel : MonoBehaviour
     private void OnDisable()
     {
         EndDrag();
+        wasLeftGripPressed = false;
+        wasRightGripPressed = false;
         registeredPanels.Remove(this);
     }
 }

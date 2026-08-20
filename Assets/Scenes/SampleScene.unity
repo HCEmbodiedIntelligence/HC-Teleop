@@ -1080,11 +1080,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   poseSender: {fileID: 254576978}
-  videoPort: 8080
+  videoPort: 7876
   offerPath: /offer
   reconnectDelaySeconds: 2
   targetImage: {fileID: 235869276}
-  videoStatusText: {fileID: 0}
+  videoStatusText: {fileID: 2073827964}
   aspectRatioFitter: {fileID: 235869274}
   videoPanel: {fileID: 0}
   useNativeResolution: 1
@@ -1160,8 +1160,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   holdSeconds: 1.2
+  releaseGraceSeconds: 0.12
+  listenPrimaryButton: 1
   listenSecondaryButton: 1
   listenMenuButton: 1
+  listenPrimaryAxisClick: 1
 --- !u!114 &254576973
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -3065,7 +3068,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!224 &2073827963
 RectTransform:
   m_ObjectHideFlags: 0

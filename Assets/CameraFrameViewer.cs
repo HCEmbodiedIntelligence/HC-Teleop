@@ -654,7 +654,16 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void OnIceConnectionChange(RTCIceConnectionState state)
     {
-        connectionState = "ICE: " + state;
+        if (state == RTCIceConnectionState.Connected || state == RTCIceConnectionState.Completed)
+        {
+            connectionState = "已连接 H.264";
+            lastError = string.Empty;
+        }
+        else
+        {
+            connectionState = "ICE: " + state;
+        }
+
         if (state == RTCIceConnectionState.Failed ||
             state == RTCIceConnectionState.Closed)
         {
@@ -664,8 +673,13 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void OnConnectionStateChange(RTCPeerConnectionState state)
     {
-        if (state == RTCPeerConnectionState.Failed ||
-            state == RTCPeerConnectionState.Closed)
+        if (state == RTCPeerConnectionState.Connected)
+        {
+            connectionState = "已连接 H.264";
+            lastError = string.Empty;
+        }
+        else if (state == RTCPeerConnectionState.Failed ||
+                 state == RTCPeerConnectionState.Closed)
         {
             connectionNeedsRestart = true;
         }

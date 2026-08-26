@@ -23,6 +23,12 @@ public class CameraFrameViewer : MonoBehaviour
     public string offerPath = "/offer";
     [Range(1f, 10f)] public float reconnectDelaySeconds = 2f;
 
+    [Header("弱网保护")]
+    [Range(0.5f, 5f)] public float weakNetworkWarningSeconds = 1.5f;
+    [Range(2f, 15f)] public float stalledStreamRestartSeconds = 5f;
+    [Range(2f, 20f)] public float maximumReconnectDelaySeconds = 10f;
+    [Range(0f, 30f)] public float packetLossWarningPercent = 5f;
+
     [Header("相机流")]
     public string streamId = "main";
     public string streamDisplayName = "主相机";
@@ -34,6 +40,8 @@ public class CameraFrameViewer : MonoBehaviour
     public RectTransform videoPanel;
     public bool useNativeResolution = true;
     [Min(200f)] public float videoPanelHeight = 540f;
+    [Min(160f)] public float minimumVideoPanelHeight = 220f;
+    [Min(300f)] public float maximumVideoPanelHeight = 1080f;
 
     private RTCPeerConnection peerConnection;
     private VideoStreamTrack receivedVideoTrack;
@@ -41,6 +49,9 @@ public class CameraFrameViewer : MonoBehaviour
     private Coroutine connectionCoroutine;
     private Coroutine statsCoroutine;
     private string currentServerIp = string.Empty;
+    private string activeConnectionServerIp = string.Empty;
+    private string activeConnectionStreamId = string.Empty;
+    private string activeConnectionOfferPath = string.Empty;
     private string connectionState = "等待发现 PC";
     private string lastError = string.Empty;
     private int consecutiveFailures;
@@ -49,22 +60,31 @@ public class CameraFrameViewer : MonoBehaviour
     private float displayedVideoFps;
     private float statusRefreshTimer;
     private float lastFrameRealtime = -100f;
+    private float lastDecodedFrameRealtime = -100f;
     private uint previousDecodedFrames;
     private ulong previousBytesReceived;
     private ulong previousPacketsReceived;
+    private int previousPacketsLost;
     private float previousStatsRealtime;
+    private float packetLossPercent;
+    private float jitterMilliseconds;
+    private bool weakNetworkActive;
+    private bool hasObservedTransportProgress;
     private bool connectionNeedsRestart;
     private CanvasGroup videoWindowCanvasGroup;
     private bool isWindowVisible = true;
     private bool statsWarningLogged;
     private static Coroutine sharedWebRtcUpdateCoroutine;
     private static CameraFrameViewer sharedWebRtcUpdateOwner;
+    private float defaultVideoPanelHeight;
+    private bool userPanelSizeOverride;
 
     private const float PanelPadding = 12f;
     private const float StatusBarHeight = 44f;
     private const float StatusBarSpacing = 8f;
     private static Sprite panelRoundedCardSprite;
     private static Sprite statusPillSprite;
+    private GameObject resizeHandlesRoot;
     private GameObject statusBarBgObj;
 
     public float DisplayedVideoFps => displayedVideoFps;
@@ -74,6 +94,10 @@ public class CameraFrameViewer : MonoBehaviour
         (receivedVideoTrack != null || (targetImage != null && targetImage.texture != null)) &&
         (Time.realtimeSinceStartup - lastFrameRealtime < 6f);
     public bool IsWindowVisible => isWindowVisible;
+    public bool HasUserPanelSizeOverride => userPanelSizeOverride;
+    public float CurrentOuterPanelHeight => videoPanel != null
+        ? videoPanel.rect.height
+        : videoPanelHeight + StatusBarHeight + StatusBarSpacing + PanelPadding * 2f;
 
     public string CompactStatus
     {
@@ -89,6 +113,7 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void Awake()
     {
+        defaultVideoPanelHeight = videoPanelHeight;
         if (targetImage != null)
         {
             targetImage.raycastTarget = false;
@@ -109,6 +134,44 @@ public class CameraFrameViewer : MonoBehaviour
                 videoStatusText = targetImage.GetComponentInChildren<TMP_Text>(true);
         }
 
+        UpdateVideoPanelLayout();
+    }
+
+    public void SetDefaultVideoPanelHeight(float height)
+    {
+        float clamped = Mathf.Clamp(
+            height,
+            minimumVideoPanelHeight,
+            maximumVideoPanelHeight);
+        defaultVideoPanelHeight = clamped;
+        if (userPanelSizeOverride)
+            return;
+
+        useNativeResolution = false;
+        videoPanelHeight = clamped;
+        UpdateVideoPanelLayout();
+    }
+
+    public void ResizeToOuterPanelHeight(float outerHeight)
+    {
+        float chromeHeight = StatusBarHeight + StatusBarSpacing + PanelPadding * 2f;
+        useNativeResolution = false;
+        userPanelSizeOverride = true;
+        videoPanelHeight = Mathf.Clamp(
+            outerHeight - chromeHeight,
+            minimumVideoPanelHeight,
+            maximumVideoPanelHeight);
+        UpdateVideoPanelLayout();
+    }
+
+    public void ResetUserPanelSize()
+    {
+        userPanelSizeOverride = false;
+        useNativeResolution = false;
+        videoPanelHeight = Mathf.Clamp(
+            defaultVideoPanelHeight > 0f ? defaultVideoPanelHeight : 540f,
+            minimumVideoPanelHeight,
+            maximumVideoPanelHeight);
         UpdateVideoPanelLayout();
     }
 
@@ -165,6 +228,23 @@ public class CameraFrameViewer : MonoBehaviour
 
     public void RestartConnection()
     {
+        string discoveredIp = poseSender != null
+            ? poseSender.ReceiverIpAddress
+            : currentServerIp;
+        bool sameEndpoint =
+            peerConnection != null &&
+            !connectionNeedsRestart &&
+            activeConnectionServerIp == discoveredIp &&
+            activeConnectionStreamId == streamId &&
+            activeConnectionOfferPath == offerPath;
+        if (sameEndpoint)
+        {
+            // Camera discovery refreshes every few seconds. Re-applying the
+            // same stream must be idempotent or all camera peers are torn down
+            // on every discovery cycle.
+            return;
+        }
+
         // A cloned active panel starts OnEnable immediately and may still be
         // negotiating the template stream. Stop that inherited coroutine
         // before applying the clone's own stream id/path.
@@ -265,7 +345,39 @@ public class CameraFrameViewer : MonoBehaviour
         if (statusRefreshTimer >= 0.25f)
         {
             statusRefreshTimer = 0f;
+            EvaluateWeakNetworkHealth();
             RefreshStatusText();
+        }
+    }
+
+    private void EvaluateWeakNetworkHealth()
+    {
+        if (!isWindowVisible || peerConnection == null || receivedVideoTrack == null)
+        {
+            weakNetworkActive = false;
+            return;
+        }
+
+        float now = Time.realtimeSinceStartup;
+        float transportAge = now - lastFrameRealtime;
+        bool statsDegraded = packetLossPercent >= packetLossWarningPercent ||
+                             jitterMilliseconds >= 100f;
+        // Unity WebRTC 3.0 on PICO does not always advance framesDecoded, and
+        // OnVideoReceived normally fires only for the first frame / size
+        // changes.  Treat RTP packet activity as the authoritative liveness
+        // signal so a healthy stream is never disconnected every few seconds.
+        weakNetworkActive = (hasObservedTransportProgress &&
+                             transportAge >= weakNetworkWarningSeconds) ||
+                            statsDegraded;
+
+        // Do not tear down a Connected peer from stats alone. Unity WebRTC
+        // 3.0-pre.8 on PICO can freeze bytesReceived / packetsReceived while
+        // video continues to render. Reconnects are driven only by real
+        // Failed callbacks; weak periods retain the last frame and allow ICE
+        // and WebRTC congestion control to recover in place.
+        if (weakNetworkActive && transportAge >= weakNetworkWarningSeconds)
+        {
+            connectionState = "弱网缓冲，保留上一帧";
         }
     }
 
@@ -329,7 +441,12 @@ public class CameraFrameViewer : MonoBehaviour
 
             if (peerConnection == null || connectionNeedsRestart)
             {
-                yield return new WaitForSecondsRealtime(reconnectDelaySeconds);
+                float retryDelay = Mathf.Min(
+                    maximumReconnectDelaySeconds,
+                    reconnectDelaySeconds * Mathf.Pow(
+                        1.6f,
+                        Mathf.Clamp(consecutiveFailures, 0, 6)));
+                yield return new WaitForSecondsRealtime(retryDelay);
             }
             else
             {
@@ -342,6 +459,9 @@ public class CameraFrameViewer : MonoBehaviour
     {
         connectionState = "正在协商 WebRTC";
         lastError = string.Empty;
+        activeConnectionServerIp = serverIp;
+        activeConnectionStreamId = streamId;
+        activeConnectionOfferPath = offerPath;
 
         RTCConfiguration configuration = default;
         peerConnection = new RTCPeerConnection(ref configuration);
@@ -472,7 +592,6 @@ public class CameraFrameViewer : MonoBehaviour
             yield break;
         }
 
-        consecutiveFailures = 0;
         connectionState = "等待视频帧";
     }
 
@@ -484,6 +603,8 @@ public class CameraFrameViewer : MonoBehaviour
         receivedVideoTrack = videoTrack;
         receivedVideoTrack.OnVideoReceived += OnVideoReceived;
         lastFrameRealtime = Time.realtimeSinceStartup;
+        lastDecodedFrameRealtime = lastFrameRealtime;
+        weakNetworkActive = false;
         connectionState = "已连接 H.264";
     }
 
@@ -495,6 +616,9 @@ public class CameraFrameViewer : MonoBehaviour
         // Unity WebRTC 只在首帧/尺寸变化时触发 OnVideoReceived，不能用它统计视频 FPS。
         // 实时帧率和后续活跃时间由 VideoStatsLoop 的 RTP 统计更新。
         lastFrameRealtime = Time.realtimeSinceStartup;
+        lastDecodedFrameRealtime = lastFrameRealtime;
+        consecutiveFailures = 0;
+        weakNetworkActive = false;
 
         if (targetImage != null && targetImage.texture != texture)
             targetImage.texture = texture;
@@ -575,8 +699,31 @@ public class CameraFrameViewer : MonoBehaviour
                 bool frameAdvanced = currentFrames > previousDecodedFrames;
                 bool transportAdvanced = currentBytes > previousBytesReceived || currentPackets > previousPacketsReceived;
 
+                if (previousStatsRealtime > 0f && transportAdvanced)
+                    hasObservedTransportProgress = true;
+
                 if (frameAdvanced || transportAdvanced)
+                {
                     lastFrameRealtime = now;
+                    consecutiveFailures = 0;
+                }
+                if (frameAdvanced)
+                    lastDecodedFrameRealtime = now;
+
+                if (previousStatsRealtime > 0f)
+                {
+                    ulong receivedDelta = currentPackets >= previousPacketsReceived
+                        ? currentPackets - previousPacketsReceived
+                        : 0;
+                    int currentLost = Mathf.Max(0, inbound.packetsLost);
+                    int lostDelta = Mathf.Max(0, currentLost - previousPacketsLost);
+                    double totalDelta = receivedDelta + (double)lostDelta;
+                    packetLossPercent = totalDelta > 0.0
+                        ? (float)(lostDelta * 100.0 / totalDelta)
+                        : 0f;
+                    previousPacketsLost = currentLost;
+                }
+                jitterMilliseconds = Mathf.Max(0f, (float)inbound.jitter * 1000f);
 
                 if (previousStatsRealtime > 0f && currentFrames >= previousDecodedFrames)
                 {
@@ -759,10 +906,74 @@ public class CameraFrameViewer : MonoBehaviour
             float statusCenterY = (-totalPanelHeight * 0.5f) + PanelPadding + (StatusBarHeight * 0.5f);
             statusRect.anchoredPosition = new Vector2(0f, statusCenterY);
         }
+
+        EnsureResizeHandles();
+    }
+
+    private void EnsureResizeHandles()
+    {
+        if (videoPanel == null)
+            return;
+
+        if (resizeHandlesRoot == null)
+        {
+            Transform found = videoPanel.Find("ResizeHandles");
+            if (found != null)
+            {
+                resizeHandlesRoot = found.gameObject;
+            }
+            else
+            {
+                resizeHandlesRoot = new GameObject(
+                    "ResizeHandles",
+                    typeof(RectTransform));
+                resizeHandlesRoot.transform.SetParent(videoPanel, false);
+
+                CreateResizeHandle("BottomLeft", new Vector2(0f, 0f), new Vector2(10f, 10f));
+                CreateResizeHandle("BottomRight", new Vector2(1f, 0f), new Vector2(-10f, 10f));
+                CreateResizeHandle("TopLeft", new Vector2(0f, 1f), new Vector2(10f, -10f));
+                CreateResizeHandle("TopRight", new Vector2(1f, 1f), new Vector2(-10f, -10f));
+            }
+        }
+
+        RectTransform rootRect = resizeHandlesRoot.GetComponent<RectTransform>();
+        rootRect.anchorMin = Vector2.zero;
+        rootRect.anchorMax = Vector2.one;
+        rootRect.offsetMin = Vector2.zero;
+        rootRect.offsetMax = Vector2.zero;
+        rootRect.localScale = Vector3.one;
+        rootRect.localRotation = Quaternion.identity;
+        resizeHandlesRoot.transform.SetAsLastSibling();
+    }
+
+    private void CreateResizeHandle(
+        string handleName,
+        Vector2 anchor,
+        Vector2 anchoredPosition)
+    {
+        GameObject handle = new GameObject(
+            handleName,
+            typeof(RectTransform),
+            typeof(CanvasRenderer),
+            typeof(Image));
+        handle.transform.SetParent(resizeHandlesRoot.transform, false);
+        RectTransform rect = handle.GetComponent<RectTransform>();
+        rect.anchorMin = anchor;
+        rect.anchorMax = anchor;
+        rect.pivot = new Vector2(0.5f, 0.5f);
+        rect.sizeDelta = new Vector2(18f, 18f);
+        rect.anchoredPosition = anchoredPosition;
+
+        Image image = handle.GetComponent<Image>();
+        image.sprite = GetStatusPillSprite(9f);
+        image.type = Image.Type.Sliced;
+        image.color = new Color(0f, 0.78f, 1f, 0.75f);
+        image.raycastTarget = false;
     }
 
     private void OnIceConnectionChange(RTCIceConnectionState state)
     {
+        Debug.Log("[Camera WebRTC] " + streamId + " ICE -> " + state);
         if (state == RTCIceConnectionState.Connected || state == RTCIceConnectionState.Completed)
         {
             connectionState = "已连接 H.264";
@@ -775,20 +986,40 @@ public class CameraFrameViewer : MonoBehaviour
 
         if (state == RTCIceConnectionState.Failed)
         {
+            consecutiveFailures++;
             connectionNeedsRestart = true;
         }
     }
 
     private void OnConnectionStateChange(RTCPeerConnectionState state)
     {
+        Debug.Log("[Camera WebRTC] " + streamId + " peer -> " + state);
         if (state == RTCPeerConnectionState.Connected)
         {
             connectionState = "已连接 H.264";
             lastError = string.Empty;
         }
+        else if (state == RTCPeerConnectionState.Disconnected)
+        {
+            // Disconnected is commonly transient on Wi-Fi.  Keep the peer
+            // alive and let ICE recover; the RTP liveness watchdog will
+            // restart only if media traffic actually stops for several
+            // seconds.
+            connectionState = "网络波动，等待恢复";
+            weakNetworkActive = true;
+        }
         else if (state == RTCPeerConnectionState.Failed)
         {
+            consecutiveFailures++;
             connectionNeedsRestart = true;
+        }
+        else if (state == RTCPeerConnectionState.Closed)
+        {
+            // ClosePeerConnection() is used during normal stream refreshes
+            // and shutdown. Unity WebRTC can dispatch this callback after
+            // the delegates have already been cleared. Treating that queued
+            // Closed event as a fault causes an endless reconnect loop.
+            connectionState = "连接已关闭";
         }
     }
 
@@ -809,8 +1040,13 @@ public class CameraFrameViewer : MonoBehaviour
         previousDecodedFrames = 0;
         previousBytesReceived = 0;
         previousPacketsReceived = 0;
+        previousPacketsLost = 0;
         previousStatsRealtime = 0f;
         displayedVideoFps = 0f;
+        packetLossPercent = 0f;
+        jitterMilliseconds = 0f;
+        weakNetworkActive = false;
+        hasObservedTransportProgress = false;
         statsWarningLogged = false;
 
         if (peerConnection != null)
@@ -834,9 +1070,16 @@ public class CameraFrameViewer : MonoBehaviour
 
         if (IsVideoConnected)
         {
+            string liveState = weakNetworkActive
+                ? "<color=#FFB826>● 弱网</color>"
+                : "<color=#00E676>● LIVE</color>";
+            string quality = packetLossPercent >= 0.1f
+                ? "  <color=#FFB826>丢包 " + packetLossPercent.ToString("F1") + "%</color>"
+                : string.Empty;
             videoStatusText.text =
-                "<b>" + streamDisplayName + "</b>  <color=#00E676>● LIVE</color>  " + frameWidth + "×" + frameHeight +
-                "  <color=#00C7FF>" + displayedVideoFps.ToString("F1") + " FPS</color>  (PC: " + currentServerIp + ")";
+                "<b>" + streamDisplayName + "</b>  " + liveState + "  " + frameWidth + "×" + frameHeight +
+                "  <color=#00C7FF>" + displayedVideoFps.ToString("F1") + " FPS</color>" + quality +
+                "  (PC: " + currentServerIp + ")";
             return;
         }
 

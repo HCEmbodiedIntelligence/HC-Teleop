@@ -272,9 +272,14 @@ public class MultiCameraDisplayManager : MonoBehaviour
             if (viewer == null)
                 continue;
 
-            viewer.useNativeResolution = validStreams.Length == 1;
             if (validStreams.Length > 1)
-                viewer.videoPanelHeight = multiCameraPanelHeight;
+            {
+                viewer.SetDefaultVideoPanelHeight(multiCameraPanelHeight);
+            }
+            else if (!viewer.HasUserPanelSizeOverride)
+            {
+                viewer.useNativeResolution = true;
+            }
             viewer.ConfigureStream(
                 stream.id,
                 string.IsNullOrEmpty(stream.name) ? stream.id : stream.name,

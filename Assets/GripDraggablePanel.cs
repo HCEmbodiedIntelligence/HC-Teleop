@@ -16,6 +16,10 @@ public class GripDraggablePanel : MonoBehaviour
     [Range(0.3f, 5f)] public float maximumDistance = 3f;
     public bool keepUpright = true;
 
+    [Header("Camera panel resize")]
+    public bool resizeCameraPanelsFromEdges = true;
+    [Range(12f, 120f)] public float resizeEdgePixels = 42f;
+
     private static GripDraggablePanel activePanel;
     private static GripDraggablePanel lastInteractedPanel;
     private static readonly List<GripDraggablePanel> registeredPanels =
@@ -48,6 +52,12 @@ public class GripDraggablePanel : MonoBehaviour
     private XRNode draggingNode;
     private float dragDistance;
     private Vector3 grabOffset;
+    private bool resizingPanel;
+    private CameraFrameViewer resizingViewer;
+    private float resizeStartOuterHeight;
+    private Vector3 resizeStartLocalPoint;
+    private bool resizeFromHorizontalEdge;
+    private bool resizeFromVerticalEdge;
     private bool wasLeftGripPressed;
     private bool wasRightGripPressed;
     private Vector3 initialLocalPosition;
@@ -124,7 +134,10 @@ public class GripDraggablePanel : MonoBehaviour
                 return;
             }
 
-            UpdateFreeDrag();
+            if (resizingPanel)
+                UpdatePanelResize();
+            else
+                UpdateFreeDrag();
             return;
         }
 
@@ -174,14 +187,56 @@ public class GripDraggablePanel : MonoBehaviour
             return false;
         }
 
-        dragDistance = Mathf.Max(0.05f, panelHitDistance);
-        grabOffset = panel.position - panelHitPoint;
-
         activePanel = this;
         lastInteractedPanel = this;
         draggingController = controller;
         draggingNode = node;
+
+        CameraFrameViewer cameraViewer =
+            GetComponentInChildren<CameraFrameViewer>(true);
+        Vector3 localHit = panel.InverseTransformPoint(panelHitPoint);
+        if (resizeCameraPanelsFromEdges &&
+            cameraViewer != null &&
+            TryGetResizeEdges(
+                localHit,
+                out resizeFromHorizontalEdge,
+                out resizeFromVerticalEdge))
+        {
+            resizingPanel = true;
+            resizingViewer = cameraViewer;
+            resizeStartOuterHeight = Mathf.Max(
+                1f,
+                cameraViewer.CurrentOuterPanelHeight);
+            resizeStartLocalPoint = localHit;
+            return true;
+        }
+
+        dragDistance = Mathf.Max(0.05f, panelHitDistance);
+        grabOffset = panel.position - panelHitPoint;
         return true;
+    }
+
+    private bool TryGetResizeEdges(
+        Vector3 localHit,
+        out bool horizontalEdge,
+        out bool verticalEdge)
+    {
+        horizontalEdge = false;
+        verticalEdge = false;
+        if (panel == null)
+            return false;
+
+        Rect rect = panel.rect;
+        float threshold = Mathf.Min(
+            resizeEdgePixels,
+            Mathf.Min(rect.width, rect.height) * 0.22f);
+        horizontalEdge =
+            localHit.x <= rect.xMin + threshold ||
+            localHit.x >= rect.xMax - threshold;
+        verticalEdge =
+            localHit.y <= rect.yMin + threshold ||
+            localHit.y >= rect.yMax - threshold;
+        return horizontalEdge || verticalEdge;
     }
 
     private static bool TryGetClosestPanelHit(
@@ -290,6 +345,53 @@ public class GripDraggablePanel : MonoBehaviour
         panel.rotation = Quaternion.LookRotation(forward.normalized, up);
     }
 
+    private void UpdatePanelResize()
+    {
+        if (draggingController == null ||
+            resizingViewer == null ||
+            panel == null)
+        {
+            return;
+        }
+
+        Ray controllerRay = new Ray(
+            draggingController.position,
+            draggingController.forward);
+        Plane panelPlane = new Plane(panel.forward, panel.position);
+        if (!panelPlane.Raycast(controllerRay, out float hitDistance) ||
+            hitDistance < 0f)
+        {
+            return;
+        }
+
+        Vector3 hitPoint = controllerRay.GetPoint(hitDistance);
+        Vector3 currentLocal = panel.InverseTransformPoint(hitPoint);
+        float ratio;
+        if (resizeFromHorizontalEdge && resizeFromVerticalEdge)
+        {
+            float startRadius = new Vector2(
+                resizeStartLocalPoint.x,
+                resizeStartLocalPoint.y).magnitude;
+            float currentRadius = new Vector2(
+                currentLocal.x,
+                currentLocal.y).magnitude;
+            ratio = currentRadius / Mathf.Max(1f, startRadius);
+        }
+        else if (resizeFromHorizontalEdge)
+        {
+            ratio = Mathf.Abs(currentLocal.x) /
+                    Mathf.Max(1f, Mathf.Abs(resizeStartLocalPoint.x));
+        }
+        else
+        {
+            ratio = Mathf.Abs(currentLocal.y) /
+                    Mathf.Max(1f, Mathf.Abs(resizeStartLocalPoint.y));
+        }
+
+        resizingViewer.ResizeToOuterPanelHeight(
+            resizeStartOuterHeight * Mathf.Clamp(ratio, 0.25f, 4f));
+    }
+
     private bool IsGripPressed(XRNode node)
     {
         InputDevice device = InputDevices.GetDeviceAtXRNode(node);
@@ -313,6 +415,10 @@ public class GripDraggablePanel : MonoBehaviour
     private void EndDrag()
     {
         draggingController = null;
+        resizingPanel = false;
+        resizingViewer = null;
+        resizeFromHorizontalEdge = false;
+        resizeFromVerticalEdge = false;
         if (activePanel == this)
             activePanel = null;
     }
@@ -320,6 +426,11 @@ public class GripDraggablePanel : MonoBehaviour
     public void ResetToInitialPose()
     {
         EndDrag();
+
+        CameraFrameViewer viewer =
+            GetComponentInChildren<CameraFrameViewer>(true);
+        if (viewer != null)
+            viewer.ResetUserPanelSize();
 
         if (panel == null)
             panel = GetComponent<RectTransform>();
@@ -355,6 +466,10 @@ public class GripDraggablePanel : MonoBehaviour
             if (item != null)
             {
                 item.EndDrag();
+                CameraFrameViewer viewer =
+                    item.GetComponentInChildren<CameraFrameViewer>(true);
+                if (viewer != null)
+                    viewer.ResetUserPanelSize();
                 if (item.panel == null)
                     item.panel = item.GetComponent<RectTransform>();
                 validPanels.Add(item);

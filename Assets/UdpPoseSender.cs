@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -63,6 +64,8 @@ public class UdpPoseSender : MonoBehaviour
     public int discoveryPort = 5006;
     public float receiverTimeoutSeconds = 6f;
     public float discoveryIntervalSeconds = 1f;
+    [Tooltip("广播被热点或防火墙拦截时，每轮额外探测当前 /24 子网中的主机数。")]
+    [Range(1, 64)] public int discoveryUnicastBatchSize = 32;
 
     [Range(1f, 200f)]
     public float sendRateHz = 100f;
@@ -110,6 +113,7 @@ public class UdpPoseSender : MonoBehaviour
     private double nextDiscoveryTime;
     private double lastReceiverReplyTime = double.NegativeInfinity;
     private double nextIpRefreshTime;
+    private int nextDiscoveryHost = 1;
     private string localIpAddress = "检测中";
     private string initializationError;
     private ControllerInputState leftInput;
@@ -285,9 +289,10 @@ public class UdpPoseSender : MonoBehaviour
             discoveryClient.Send(request, request.Length,
                 new IPEndPoint(IPAddress.Broadcast, discoveryPort));
 
-            // 2. 本地子网定向广播（如 10.42.0.255，增强 Android/Pico Wi-Fi 热点穿透）
-            if (IPAddress.TryParse(localIpAddress, out IPAddress ip) &&
-                ip.AddressFamily == AddressFamily.InterNetwork)
+            // 2. 对所有有效 IPv4 网卡发送定向广播。开发机上常同时
+            // 存在 Meta、Hyper-V、WLAN 和以太网，只使用默认出口会扫错网段。
+            List<IPAddress> localAddresses = FindAllLocalIpv4Addresses();
+            foreach (IPAddress ip in localAddresses)
             {
                 byte[] ipBytes = ip.GetAddressBytes();
                 ipBytes[3] = 255;
@@ -297,6 +302,43 @@ public class UdpPoseSender : MonoBehaviour
                     discoveryClient.Send(request, request.Length,
                         new IPEndPoint(subnetBroadcast, discoveryPort));
                 }
+
+            }
+
+            // PICO 热点、Windows 多网卡以及部分路由器会丢弃广播回复。
+            // 在尚未找到接收端时，对每个有效 /24 子网分批轮询。所有
+            // 网段使用同一批主机号，所以 1-254 只需约八轮即可覆盖。
+            if (receiverEndPoint == null && localAddresses.Count > 0)
+            {
+                int probes = Mathf.Clamp(discoveryUnicastBatchSize, 1, 64);
+                int firstHost = nextDiscoveryHost;
+                foreach (IPAddress ip in localAddresses)
+                {
+                    byte[] localBytes = ip.GetAddressBytes();
+                    int host = firstHost;
+                    for (int index = 0; index < probes; index++)
+                    {
+                        if (host != localBytes[3])
+                        {
+                            byte[] targetBytes = (byte[])localBytes.Clone();
+                            targetBytes[3] = (byte)host;
+                            discoveryClient.Send(
+                                request,
+                                request.Length,
+                                new IPEndPoint(
+                                    new IPAddress(targetBytes),
+                                    discoveryPort));
+                        }
+
+                        host++;
+                        if (host >= 255)
+                            host = 1;
+                    }
+                }
+
+                nextDiscoveryHost = firstHost + probes;
+                while (nextDiscoveryHost >= 255)
+                    nextDiscoveryHost -= 254;
             }
         }
         catch (Exception exception)
@@ -336,6 +378,7 @@ public class UdpPoseSender : MonoBehaviour
 
                 if (changed)
                 {
+                    nextDiscoveryHost = 1;
                     nextSendTime = now;
                     ResetInputHistory();
                     Debug.Log("PC receiver discovered: " + ReceiverAddress);
@@ -679,14 +722,32 @@ public class UdpPoseSender : MonoBehaviour
 
     private static string FindLocalIpv4Address()
     {
+        List<IPAddress> addresses = FindAllLocalIpv4Addresses();
+        if (addresses.Count > 0)
+            return addresses[0].ToString();
+        return "不可用";
+    }
+
+    private static List<IPAddress> FindAllLocalIpv4Addresses()
+    {
+        var addresses = new List<IPAddress>();
+
+        // Android/PICO 上主机名解析有时只返回 127.0.0.1。通过一个不发送
+        // 数据的 UDP connect 先取得系统实际选用的 Wi-Fi 地址。
         try
         {
-            using (Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+            using (Socket socket = new Socket(
+                       AddressFamily.InterNetwork,
+                       SocketType.Dgram,
+                       ProtocolType.Udp))
             {
                 socket.Connect("8.8.8.8", 65530);
                 IPEndPoint endPoint = socket.LocalEndPoint as IPEndPoint;
-                if (endPoint != null)
-                    return endPoint.Address.ToString();
+                if (endPoint != null &&
+                    !IsBenchmarkAdapterAddress(endPoint.Address))
+                {
+                    addresses.Add(endPoint.Address);
+                }
             }
         }
         catch { }
@@ -697,13 +758,42 @@ public class UdpPoseSender : MonoBehaviour
             {
                 if (address.AddressFamily == AddressFamily.InterNetwork &&
                     !IPAddress.IsLoopback(address) &&
-                    !address.ToString().StartsWith("169.254.", StringComparison.Ordinal))
-                    return address.ToString();
+                    !address.ToString().StartsWith("169.254.", StringComparison.Ordinal) &&
+                    !IsBenchmarkAdapterAddress(address) &&
+                    !addresses.Contains(address))
+                {
+                    addresses.Add(address);
+                }
             }
         }
         catch { }
 
-        return "不可用";
+        addresses.Sort((left, right) =>
+            ScoreLocalAddress(right).CompareTo(ScoreLocalAddress(left)));
+        return addresses;
+    }
+
+    private static bool IsBenchmarkAdapterAddress(IPAddress address)
+    {
+        byte[] bytes = address.GetAddressBytes();
+        // 198.18.0.0/15 是基准测试/虚拟代理网段，Meta 软件会创建该网卡，
+        // 不应将它当作机器人局域网进行扫描。
+        return bytes.Length == 4 && bytes[0] == 198 &&
+               (bytes[1] == 18 || bytes[1] == 19);
+    }
+
+    private static int ScoreLocalAddress(IPAddress address)
+    {
+        byte[] bytes = address.GetAddressBytes();
+        if (bytes.Length != 4)
+            return 0;
+        if (bytes[0] == 192 && bytes[1] == 168)
+            return 100;
+        if (bytes[0] == 10)
+            return 90;
+        if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
+            return 70;
+        return 60;
     }
 
     private void OnApplicationPause(bool paused)

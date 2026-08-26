@@ -23,6 +23,10 @@ public class CameraFrameViewer : MonoBehaviour
     public string offerPath = "/offer";
     [Range(1f, 10f)] public float reconnectDelaySeconds = 2f;
 
+    [Header("相机流")]
+    public string streamId = "main";
+    public string streamDisplayName = "主相机";
+
     [Header("显示")]
     public RawImage targetImage;
     public TMP_Text videoStatusText;
@@ -33,7 +37,6 @@ public class CameraFrameViewer : MonoBehaviour
 
     private RTCPeerConnection peerConnection;
     private VideoStreamTrack receivedVideoTrack;
-    private RTCRtpReceiver videoReceiver;
     private Coroutine webRtcUpdateCoroutine;
     private Coroutine connectionCoroutine;
     private Coroutine statsCoroutine;
@@ -53,7 +56,9 @@ public class CameraFrameViewer : MonoBehaviour
     private bool connectionNeedsRestart;
     private CanvasGroup videoWindowCanvasGroup;
     private bool isWindowVisible = true;
-    private int receivedFramesCount;
+    private bool statsWarningLogged;
+    private static Coroutine sharedWebRtcUpdateCoroutine;
+    private static CameraFrameViewer sharedWebRtcUpdateOwner;
 
     private const float PanelPadding = 12f;
     private const float StatusBarHeight = 44f;
@@ -63,6 +68,8 @@ public class CameraFrameViewer : MonoBehaviour
     private GameObject statusBarBgObj;
 
     public float DisplayedVideoFps => displayedVideoFps;
+    public string StreamId => streamId;
+    public string StreamDisplayName => streamDisplayName;
     public bool IsVideoConnected =>
         (receivedVideoTrack != null || (targetImage != null && targetImage.texture != null)) &&
         (Time.realtimeSinceStartup - lastFrameRealtime < 6f);
@@ -73,9 +80,9 @@ public class CameraFrameViewer : MonoBehaviour
         get
         {
             if (!IsVideoConnected)
-                return "相机: " + connectionState;
+                return streamDisplayName + ": " + connectionState;
 
-            return "相机: WebRTC H.264  " + frameWidth + "×" + frameHeight + "\n" +
+            return streamDisplayName + ": WebRTC H.264  " + frameWidth + "×" + frameHeight + "\n" +
                    "视频 FPS: " + displayedVideoFps.ToString("F1");
         }
     }
@@ -107,15 +114,75 @@ public class CameraFrameViewer : MonoBehaviour
 
     public void SetWindowVisible(bool visible)
     {
+        bool visibilityChanged = isWindowVisible != visible;
         isWindowVisible = visible;
         EnsureVideoWindowCanvasGroup();
 
-        if (videoWindowCanvasGroup == null)
-            return;
+        if (videoWindowCanvasGroup != null)
+        {
+            videoWindowCanvasGroup.alpha = visible ? 1f : 0f;
+            videoWindowCanvasGroup.interactable = visible;
+            videoWindowCanvasGroup.blocksRaycasts = visible;
+        }
 
-        videoWindowCanvasGroup.alpha = visible ? 1f : 0f;
-        videoWindowCanvasGroup.interactable = visible;
-        videoWindowCanvasGroup.blocksRaycasts = visible;
+        // “关闭相机”同时停止该路 WebRTC，而不只是隐藏画面。
+        // 多相机模式下这可以立即释放头显解码和服务端编码资源。
+        if (!visible && visibilityChanged)
+        {
+            ClosePeerConnection(true);
+            connectionNeedsRestart = false;
+            connectionState = "已关闭";
+        }
+        else if (visible && visibilityChanged && isActiveAndEnabled)
+        {
+            connectionNeedsRestart = true;
+            connectionState = "准备连接";
+            EnsureRuntimeCoroutines();
+        }
+    }
+
+    public void ConfigureStream(string id, string displayName, string path)
+    {
+        string nextId = string.IsNullOrWhiteSpace(id) ? "main" : id.Trim();
+        string nextName = string.IsNullOrWhiteSpace(displayName)
+            ? nextId
+            : displayName.Trim();
+        string nextPath = string.IsNullOrWhiteSpace(path)
+            ? "/offer/" + nextId
+            : path;
+        bool connectionChanged = streamId != nextId || offerPath != nextPath;
+
+        streamId = nextId;
+        streamDisplayName = nextName;
+        offerPath = nextPath;
+        gameObject.name = "CameraStream_" + streamId;
+        if (connectionChanged)
+            RestartConnection();
+        EnsureRuntimeCoroutines();
+        UpdateVideoPanelLayout();
+        RefreshStatusText();
+    }
+
+    public void RestartConnection()
+    {
+        // A cloned active panel starts OnEnable immediately and may still be
+        // negotiating the template stream. Stop that inherited coroutine
+        // before applying the clone's own stream id/path.
+        if (connectionCoroutine != null)
+        {
+            StopCoroutine(connectionCoroutine);
+            connectionCoroutine = null;
+        }
+
+        ClosePeerConnection(true);
+        connectionNeedsRestart = isWindowVisible;
+        connectionState = isWindowVisible ? "准备连接" : "已关闭";
+        EnsureRuntimeCoroutines();
+    }
+
+    public void ApplyLayoutNow()
+    {
+        UpdateVideoPanelLayout();
     }
 
     private void EnsureVideoWindowCanvasGroup()
@@ -134,39 +201,66 @@ public class CameraFrameViewer : MonoBehaviour
         }
     }
 
-    private float fpsCalcTimer = 0f;
-
     private void OnEnable()
     {
-        webRtcUpdateCoroutine = StartCoroutine(WebRTC.Update());
-        connectionCoroutine = StartCoroutine(ConnectionLoop());
+        EnsureRuntimeCoroutines();
+    }
+
+    private void EnsureRuntimeCoroutines()
+    {
+        if (!isActiveAndEnabled)
+            return;
+
+        StartSharedWebRtcUpdate();
+        if (connectionCoroutine == null)
+            connectionCoroutine = StartCoroutine(ConnectionLoop());
+        if (statsCoroutine == null)
+            statsCoroutine = StartCoroutine(VideoStatsLoop());
     }
 
     private void OnDisable()
     {
         if (connectionCoroutine != null)
             StopCoroutine(connectionCoroutine);
-        if (webRtcUpdateCoroutine != null)
-            StopCoroutine(webRtcUpdateCoroutine);
+        if (statsCoroutine != null)
+            StopCoroutine(statsCoroutine);
 
         connectionCoroutine = null;
-        webRtcUpdateCoroutine = null;
+        statsCoroutine = null;
+
+        // 先关闭 PeerConnection，再停止/移交全局 WebRTC 更新循环。
+        // 反过来会让 Unity WebRTC 的 NegotiationNeeded 回调访问已停止的上下文。
         ClosePeerConnection(true);
+        StopSharedWebRtcUpdateIfOwner();
+        webRtcUpdateCoroutine = null;
+    }
+
+    private void StartSharedWebRtcUpdate()
+    {
+        if (sharedWebRtcUpdateCoroutine != null)
+            return;
+        sharedWebRtcUpdateOwner = this;
+        sharedWebRtcUpdateCoroutine = StartCoroutine(WebRTC.Update());
+        webRtcUpdateCoroutine = sharedWebRtcUpdateCoroutine;
+    }
+
+    private void StopSharedWebRtcUpdateIfOwner()
+    {
+        if (sharedWebRtcUpdateOwner != this || sharedWebRtcUpdateCoroutine == null)
+            return;
+
+        StopCoroutine(sharedWebRtcUpdateCoroutine);
+        sharedWebRtcUpdateCoroutine = null;
+        sharedWebRtcUpdateOwner = null;
+
+        CameraFrameViewer replacement = FindObjectsOfType<CameraFrameViewer>(true)
+            .FirstOrDefault(viewer => viewer != this && viewer.isActiveAndEnabled);
+        if (replacement != null)
+            replacement.StartSharedWebRtcUpdate();
     }
 
     private void Update()
     {
-        fpsCalcTimer += Time.unscaledDeltaTime;
-        if (fpsCalcTimer >= 1.0f)
-        {
-            if (fpsCalcTimer > 0f)
-            {
-                displayedVideoFps = receivedFramesCount / fpsCalcTimer;
-                receivedFramesCount = 0;
-            }
-            fpsCalcTimer = 0f;
-        }
-
         statusRefreshTimer += Time.unscaledDeltaTime;
         if (statusRefreshTimer >= 0.25f)
         {
@@ -179,9 +273,18 @@ public class CameraFrameViewer : MonoBehaviour
     {
         while (true)
         {
+            if (!isWindowVisible)
+            {
+                yield return new WaitForSecondsRealtime(0.25f);
+                continue;
+            }
+
             if (poseSender == null)
             {
-                connectionState = "未设置 UdpPoseSender";
+                poseSender = FindObjectOfType<UdpPoseSender>(true);
+                connectionState = poseSender == null
+                    ? "未设置 UdpPoseSender"
+                    : "等待发现 PC";
                 yield return new WaitForSecondsRealtime(1f);
                 continue;
             }
@@ -220,6 +323,8 @@ public class CameraFrameViewer : MonoBehaviour
                 connectionNeedsRestart = false;
             }
 
+            connectionNeedsRestart = false;
+            Debug.Log($"[Camera WebRTC] {streamId} -> http://{currentServerIp}:{videoPort}{offerPath}");
             yield return StartCoroutine(ConnectToServer(currentServerIp));
 
             if (peerConnection == null || connectionNeedsRestart)
@@ -377,7 +482,6 @@ public class CameraFrameViewer : MonoBehaviour
             return;
 
         receivedVideoTrack = videoTrack;
-        videoReceiver = trackEvent.Transceiver.Receiver;
         receivedVideoTrack.OnVideoReceived += OnVideoReceived;
         lastFrameRealtime = Time.realtimeSinceStartup;
         connectionState = "已连接 H.264";
@@ -388,9 +492,9 @@ public class CameraFrameViewer : MonoBehaviour
         if (texture == null)
             return;
 
-        // 收到画面纹理即时更新活跃时间戳
+        // Unity WebRTC 只在首帧/尺寸变化时触发 OnVideoReceived，不能用它统计视频 FPS。
+        // 实时帧率和后续活跃时间由 VideoStatsLoop 的 RTP 统计更新。
         lastFrameRealtime = Time.realtimeSinceStartup;
-        receivedFramesCount++;
 
         if (targetImage != null && targetImage.texture != texture)
             targetImage.texture = texture;
@@ -412,93 +516,117 @@ public class CameraFrameViewer : MonoBehaviour
         {
             yield return wait;
 
-            float now = Time.realtimeSinceStartup;
-
-            // 1. 提取底层解码与 RTP 接收统计
-            if (videoReceiver != null)
+            RTCPeerConnection statsConnection = peerConnection;
+            if (statsConnection == null || receivedVideoTrack == null)
             {
-                RTCStatsReportAsyncOperation operation = videoReceiver.GetStats();
-                yield return operation;
+                displayedVideoFps = 0f;
+                continue;
+            }
 
+            RTCStatsReportAsyncOperation operation;
+            try
+            {
+                // 使用完整 PeerConnection 的单次统计，避免 Android 上 Receiver GetStats 重入。
+                operation = statsConnection.GetStats();
+            }
+            catch (Exception exception)
+            {
+                WarnStatsOnce(exception.Message);
+                continue;
+            }
+
+            yield return operation;
+
+            // 统计等待期间如果连接已被替换，丢弃旧连接结果。
+            if (statsConnection != peerConnection)
+            {
                 if (!operation.IsError && operation.Value != null)
+                    operation.Value.Dispose();
+                continue;
+            }
+
+            if (operation.IsError || operation.Value == null)
+            {
+                WarnStatsOnce(operation.IsError ? operation.Error.message : "empty report");
+                continue;
+            }
+
+            RTCStatsReport report = operation.Value;
+            try
+            {
+                RTCInboundRTPStreamStats[] inboundStreams = report.Stats.Values
+                    .OfType<RTCInboundRTPStreamStats>()
+                    .ToArray();
+                RTCInboundRTPStreamStats inbound = inboundStreams
+                    .FirstOrDefault(item => string.Equals(item.kind, "video", StringComparison.OrdinalIgnoreCase))
+                    ?? inboundStreams.FirstOrDefault();
+
+                if (inbound == null)
                 {
-                    RTCStatsReport report = operation.Value;
-                    RTCInboundRTPStreamStats inbound = report.Stats.Values
-                        .OfType<RTCInboundRTPStreamStats>()
-                        .FirstOrDefault();
-
-                    if (inbound != null)
-                    {
-                        ulong currentBytes = inbound.bytesReceived;
-                        ulong currentPackets = inbound.packetsReceived;
-                        uint currentFrames = inbound.framesDecoded > 0 ? inbound.framesDecoded : inbound.framesReceived;
-
-                        // 只要有字节、数据包或解码帧增加，说明视频正在正常传输
-                        if (currentBytes > previousBytesReceived || currentPackets > previousPacketsReceived || currentFrames > previousDecodedFrames)
-                        {
-                            lastFrameRealtime = now;
-                        }
-
-                        if (previousStatsRealtime > 0f && currentFrames >= previousDecodedFrames)
-                        {
-                            float elapsed = now - previousStatsRealtime;
-                            uint decodedDelta = currentFrames - previousDecodedFrames;
-
-                            if (elapsed > 0f && decodedDelta > 0)
-                                displayedVideoFps = decodedDelta / elapsed;
-                        }
-                        else if (inbound.framesPerSecond > 0)
-                        {
-                            displayedVideoFps = (float)inbound.framesPerSecond;
-                        }
-
-                        previousDecodedFrames = currentFrames;
-                        previousBytesReceived = currentBytes;
-                        previousPacketsReceived = currentPackets;
-                        previousStatsRealtime = now;
-
-                        if (inbound.frameWidth > 0 && inbound.frameHeight > 0)
-                        {
-                            frameWidth = (int)inbound.frameWidth;
-                            frameHeight = (int)inbound.frameHeight;
-                            UpdateVideoPanelLayout();
-                        }
-                    }
-                    else
-                    {
-                        // 统计对象未就绪但 ICE 连接正常时，保底维持活跃
-                        if (peerConnection != null &&
-                            (peerConnection.IceConnectionState == RTCIceConnectionState.Connected ||
-                             peerConnection.IceConnectionState == RTCIceConnectionState.Completed))
-                        {
-                            lastFrameRealtime = now;
-                        }
-                    }
-
-                    report.Dispose();
+                    WarnStatsOnce("video inbound-rtp not ready");
                     continue;
                 }
-            }
 
-            // 2. 状态报告不可用时的保底维持
-            if (peerConnection != null &&
-                (peerConnection.IceConnectionState == RTCIceConnectionState.Connected ||
-                 peerConnection.IceConnectionState == RTCIceConnectionState.Completed))
-            {
-                lastFrameRealtime = now;
-            }
+                statsWarningLogged = false;
+                float now = Time.realtimeSinceStartup;
+                ulong currentBytes = inbound.bytesReceived;
+                ulong currentPackets = inbound.packetsReceived;
+                uint currentFrames = inbound.framesDecoded > 0 ? inbound.framesDecoded : inbound.framesReceived;
+                bool frameAdvanced = currentFrames > previousDecodedFrames;
+                bool transportAdvanced = currentBytes > previousBytesReceived || currentPackets > previousPacketsReceived;
 
-            if (receivedFramesCount > 0 && previousStatsRealtime > 0f)
-            {
-                float elapsed = now - previousStatsRealtime;
-                if (elapsed > 0f)
+                if (frameAdvanced || transportAdvanced)
+                    lastFrameRealtime = now;
+
+                if (previousStatsRealtime > 0f && currentFrames >= previousDecodedFrames)
                 {
-                    displayedVideoFps = receivedFramesCount / elapsed;
-                    receivedFramesCount = 0;
+                    float elapsed = now - previousStatsRealtime;
+                    uint decodedDelta = currentFrames - previousDecodedFrames;
+                    if (elapsed > 0f && decodedDelta > 0)
+                        displayedVideoFps = decodedDelta / elapsed;
+                    else
+                        displayedVideoFps = inbound.framesPerSecond > 0
+                            ? (float)inbound.framesPerSecond
+                            : 0f;
+                }
+                else
+                {
+                    displayedVideoFps = inbound.framesPerSecond > 0
+                        ? (float)inbound.framesPerSecond
+                        : 0f;
+                }
+
+                previousDecodedFrames = currentFrames;
+                previousBytesReceived = currentBytes;
+                previousPacketsReceived = currentPackets;
+                previousStatsRealtime = now;
+
+                if (inbound.frameWidth > 0 && inbound.frameHeight > 0 &&
+                    (frameWidth != (int)inbound.frameWidth || frameHeight != (int)inbound.frameHeight))
+                {
+                    frameWidth = (int)inbound.frameWidth;
+                    frameHeight = (int)inbound.frameHeight;
+                    UpdateVideoPanelLayout();
                 }
             }
-            previousStatsRealtime = now;
+            catch (Exception exception)
+            {
+                WarnStatsOnce(exception.Message);
+            }
+            finally
+            {
+                report.Dispose();
+            }
         }
+    }
+
+    private void WarnStatsOnce(string message)
+    {
+        if (statsWarningLogged)
+            return;
+
+        statsWarningLogged = true;
+        Debug.LogWarning("WebRTC 视频统计暂不可用: " + message);
     }
 
     private void UpdateVideoPanelLayout()
@@ -678,13 +806,12 @@ public class CameraFrameViewer : MonoBehaviour
         if (receivedVideoTrack != null)
             receivedVideoTrack.OnVideoReceived -= OnVideoReceived;
         receivedVideoTrack = null;
-        videoReceiver = null;
         previousDecodedFrames = 0;
         previousBytesReceived = 0;
         previousPacketsReceived = 0;
         previousStatsRealtime = 0f;
         displayedVideoFps = 0f;
-        receivedFramesCount = 0;
+        statsWarningLogged = false;
 
         if (peerConnection != null)
         {
@@ -708,12 +835,12 @@ public class CameraFrameViewer : MonoBehaviour
         if (IsVideoConnected)
         {
             videoStatusText.text =
-                "<color=#00E676>● LIVE</color>  " + frameWidth + "×" + frameHeight +
+                "<b>" + streamDisplayName + "</b>  <color=#00E676>● LIVE</color>  " + frameWidth + "×" + frameHeight +
                 "  <color=#00C7FF>" + displayedVideoFps.ToString("F1") + " FPS</color>  (PC: " + currentServerIp + ")";
             return;
         }
 
-        videoStatusText.text = "<color=#FFB826>● 相机视频: " + connectionState + "</color>";
+        videoStatusText.text = "<b>" + streamDisplayName + "</b>  <color=#FFB826>● " + connectionState + "</color>";
         if (!string.IsNullOrEmpty(lastError))
             videoStatusText.text += "  <size=80%><color=#FF4D4D>(" + lastError + ")</color></size>";
     }

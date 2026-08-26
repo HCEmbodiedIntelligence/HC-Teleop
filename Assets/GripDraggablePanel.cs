@@ -20,6 +20,8 @@ public class GripDraggablePanel : MonoBehaviour
     private static GripDraggablePanel lastInteractedPanel;
     private static readonly List<GripDraggablePanel> registeredPanels =
         new List<GripDraggablePanel>();
+    private static readonly HashSet<int> positionedCanvasIds =
+        new HashSet<int>();
     private static int lastDepthSortFrame = -1;
     private static UdpPoseSender cachedPoseSender;
 
@@ -53,6 +55,17 @@ public class GripDraggablePanel : MonoBehaviour
     private Vector3 initialLocalScale;
     private bool hasInitialPose;
 
+    // 与截图中左侧控制栏相同的舒适观看距离。之前场景使用 1.5 m，
+    // 在头显里会显得过小；0.95 m 可以保持完整视野并提高可读性。
+    private const float ComfortableCanvasDistance = 0.95f;
+    private const float ComfortableCanvasYOffset = -0.035f;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    private static void ResetStaticCanvasState()
+    {
+        positionedCanvasIds.Clear();
+    }
+
     private void Awake()
     {
         panel = GetComponent<RectTransform>();
@@ -61,6 +74,7 @@ public class GripDraggablePanel : MonoBehaviour
         initialLocalScale = panel.localScale;
         hasInitialPose = true;
         FindHeadIfNeeded();
+        PositionSharedCanvas(panel.parent as RectTransform, false);
     }
 
     private void OnEnable()
@@ -367,7 +381,10 @@ public class GripDraggablePanel : MonoBehaviour
             sameParent &= item.panel.parent == sharedParent;
 
         if (sameParent)
+        {
+            PositionSharedCanvas(sharedParent, true);
             ArrangeOnSharedCanvas(validPanels, sharedParent);
+        }
         else
             ArrangeInWorld(validPanels);
 
@@ -383,10 +400,77 @@ public class GripDraggablePanel : MonoBehaviour
         return 2;
     }
 
+    private static void PositionSharedCanvas(RectTransform canvasRoot, bool force)
+    {
+        if (canvasRoot == null)
+            return;
+
+        Canvas canvas = canvasRoot.GetComponent<Canvas>();
+        if (canvas == null || canvas.renderMode != RenderMode.WorldSpace)
+            return;
+
+        int id = canvasRoot.GetInstanceID();
+        if (!force && positionedCanvasIds.Contains(id))
+            return;
+
+        Transform view = Camera.main != null ? Camera.main.transform : null;
+        if (view == null)
+            return;
+
+        // 当前场景的 Canvas 是 Main Camera 的直接子对象。使用局部坐标
+        // 可以让初始和重置位置严格一致，也能保证界面始终正对视线。
+        if (canvasRoot.parent == view)
+        {
+            canvasRoot.localPosition = new Vector3(
+                0f,
+                ComfortableCanvasYOffset,
+                ComfortableCanvasDistance);
+            canvasRoot.localRotation = Quaternion.identity;
+        }
+        else
+        {
+            canvasRoot.position = view.position +
+                                  view.forward * ComfortableCanvasDistance +
+                                  view.up * ComfortableCanvasYOffset;
+            canvasRoot.rotation = Quaternion.LookRotation(
+                canvasRoot.position - view.position,
+                view.up);
+        }
+
+        positionedCanvasIds.Add(id);
+    }
+
     private static void ArrangeOnSharedCanvas(
         List<GripDraggablePanel> panels,
         RectTransform parent)
     {
+        var cameraPanels = new List<GripDraggablePanel>();
+        var dashboardPanels = new List<GripDraggablePanel>();
+        foreach (GripDraggablePanel item in panels)
+        {
+            if (item.GetComponentInChildren<CameraFrameViewer>(true) != null ||
+                item.name.IndexOf("Video", System.StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                cameraPanels.Add(item);
+            }
+            else
+            {
+                dashboardPanels.Add(item);
+            }
+        }
+
+        // Four camera windows must be treated as a 2x2 block. Laying all five
+        // panels out in one row made the B-button reset scale them to roughly
+        // half their useful size.
+        if (cameraPanels.Count >= 2)
+        {
+            ArrangeDashboardAndCameraGrid(
+                dashboardPanels,
+                cameraPanels,
+                parent);
+            return;
+        }
+
         const float gap = 64f;
         const float horizontalMargin = 100f;
         const float verticalMargin = 80f;
@@ -421,6 +505,97 @@ public class GripDraggablePanel : MonoBehaviour
         }
     }
 
+    private static void ArrangeDashboardAndCameraGrid(
+        List<GripDraggablePanel> dashboardPanels,
+        List<GripDraggablePanel> cameraPanels,
+        RectTransform parent)
+    {
+        const float sectionGap = 56f;
+        const float cellGap = 28f;
+        const float horizontalMargin = 100f;
+        const float verticalMargin = 80f;
+        const int columns = 2;
+
+        float dashboardWidth = 0f;
+        float dashboardHeight = 0f;
+        foreach (GripDraggablePanel item in dashboardPanels)
+        {
+            dashboardWidth = Mathf.Max(dashboardWidth, item.panel.rect.width);
+            dashboardHeight += Mathf.Max(1f, item.panel.rect.height);
+        }
+        if (dashboardPanels.Count > 1)
+            dashboardHeight += cellGap * (dashboardPanels.Count - 1);
+
+        float cameraWidth = 1f;
+        float cameraHeight = 1f;
+        foreach (GripDraggablePanel item in cameraPanels)
+        {
+            cameraWidth = Mathf.Max(cameraWidth, item.panel.rect.width);
+            cameraHeight = Mathf.Max(cameraHeight, item.panel.rect.height);
+        }
+
+        int rows = Mathf.CeilToInt((float)cameraPanels.Count / columns);
+        float cameraGridWidth = cameraWidth * columns + cellGap * (columns - 1);
+        float cameraGridHeight = cameraHeight * rows + cellGap * (rows - 1);
+        float rawGroupWidth = cameraGridWidth;
+        if (dashboardPanels.Count > 0)
+            rawGroupWidth += dashboardWidth + sectionGap;
+        float rawGroupHeight = Mathf.Max(dashboardHeight, cameraGridHeight);
+
+        float availableWidth = Mathf.Max(600f, parent.rect.width - horizontalMargin);
+        float availableHeight = Mathf.Max(400f, parent.rect.height - verticalMargin);
+        float fitScale = Mathf.Min(
+            0.9f,
+            availableWidth / Mathf.Max(1f, rawGroupWidth),
+            availableHeight / Mathf.Max(1f, rawGroupHeight));
+
+        // Keep the reset comfortably readable. The 2x2 layout normally fits
+        // around 0.7-0.8 on the current world-space canvas.
+        fitScale = Mathf.Clamp(fitScale, 0.65f, 0.9f);
+
+        float fittedGroupWidth = rawGroupWidth * fitScale;
+        float groupLeft = -fittedGroupWidth * 0.5f;
+
+        if (dashboardPanels.Count > 0)
+        {
+            float y = dashboardHeight * fitScale * 0.5f;
+            foreach (GripDraggablePanel item in dashboardPanels)
+            {
+                float height = item.panel.rect.height * fitScale;
+                item.panel.localRotation = Quaternion.identity;
+                item.panel.localScale = Vector3.one * fitScale;
+                item.panel.anchoredPosition = new Vector2(
+                    groupLeft + dashboardWidth * fitScale * 0.5f,
+                    y - height * 0.5f);
+                y -= height + cellGap * fitScale;
+            }
+        }
+
+        float cameraLeft = groupLeft;
+        if (dashboardPanels.Count > 0)
+            cameraLeft += (dashboardWidth + sectionGap) * fitScale;
+
+        for (int index = 0; index < cameraPanels.Count; index++)
+        {
+            int row = index / columns;
+            int column = index % columns;
+            int itemsInRow = Mathf.Min(columns, cameraPanels.Count - row * columns);
+            float rowWidth = cameraWidth * itemsInRow + cellGap * (itemsInRow - 1);
+            float rowLeft = cameraLeft +
+                (cameraGridWidth - rowWidth) * fitScale * 0.5f;
+
+            GripDraggablePanel item = cameraPanels[index];
+            item.panel.localRotation = Quaternion.identity;
+            item.panel.localScale = Vector3.one * fitScale;
+            item.panel.anchoredPosition = new Vector2(
+                rowLeft +
+                    (column * (cameraWidth + cellGap) + cameraWidth * 0.5f) *
+                    fitScale,
+                ((rows - 1) * 0.5f - row) *
+                    (cameraHeight + cellGap) * fitScale);
+        }
+    }
+
     private static void ArrangeInWorld(List<GripDraggablePanel> panels)
     {
         Transform view = Camera.main != null ? Camera.main.transform : null;
@@ -433,7 +608,9 @@ public class GripDraggablePanel : MonoBehaviour
 
         float spacing = 0.72f;
         float start = -spacing * (panels.Count - 1) * 0.5f;
-        Vector3 center = view.position + view.forward * 1.5f;
+        Vector3 center = view.position +
+                         view.forward * ComfortableCanvasDistance +
+                         view.up * ComfortableCanvasYOffset;
 
         for (int index = 0; index < panels.Count; index++)
         {

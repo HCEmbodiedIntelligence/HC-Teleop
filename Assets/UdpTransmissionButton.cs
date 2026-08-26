@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -16,6 +17,7 @@ public class UdpTransmissionButton : MonoBehaviour
 
     private Button udpButton;
     private CameraFrameViewer videoViewer;
+    private MultiCameraDisplayManager multiCameraManager;
     private ControllerVisualState visualState;
 
     // UI 控件引用
@@ -32,10 +34,14 @@ public class UdpTransmissionButton : MonoBehaviour
     private TMP_Text recIcon;
     private Button recButton;
 
-    private Image appFpsRing;
-    private TMP_Text appFpsValue;
-    private Image cameraFpsRing;
-    private TMP_Text cameraFpsValue;
+    private RectTransform cameraStreamRow;
+    private string cameraStreamSignature = string.Empty;
+    private readonly Dictionary<string, Image> cameraStreamRings =
+        new Dictionary<string, Image>();
+    private readonly Dictionary<string, TMP_Text> cameraStreamValues =
+        new Dictionary<string, TMP_Text>();
+    private readonly Dictionary<string, TMP_Text> cameraStreamCaptions =
+        new Dictionary<string, TMP_Text>();
 
     private Image markerRing;
     private TMP_Text markerCaption;
@@ -46,9 +52,6 @@ public class UdpTransmissionButton : MonoBehaviour
     private TMP_Text trackingSummaryText;
 
     private float refreshTimer;
-    private float fpsTimer;
-    private int fpsFrameCount;
-    private float displayedFps;
 
     // 缓存的高清程序化纹理 Sprites
     private static Sprite circleSprite;
@@ -74,6 +77,7 @@ public class UdpTransmissionButton : MonoBehaviour
     {
         udpButton = GetComponent<Button>();
         videoViewer = FindObjectOfType<CameraFrameViewer>(true);
+        EnsureMultiCameraManager();
         visualState = EnsureControllerVisualState();
         BuildInterface();
     }
@@ -85,7 +89,7 @@ public class UdpTransmissionButton : MonoBehaviour
             return;
 
         // 面板主体 (大尺寸现代悬浮卡片)
-        panel.sizeDelta = new Vector2(900f, 440f);
+        panel.sizeDelta = new Vector2(900f, 560f);
         Image panelImage = panel.GetComponent<Image>();
         if (panelImage != null)
         {
@@ -97,27 +101,31 @@ public class UdpTransmissionButton : MonoBehaviour
         // 顶部品牌与状态栏 (Header Bar)
         BuildHeader(panel);
 
-        // 主控制行 Row 1 (UDP, 相机, 录制, 帧率)
+        // 主控制行 Row 1 (UDP, 相机, 录制)
         RectTransform row1 = Background(panel, "PrimaryToolbarRow",
-            new Vector2(0f, 58f), new Vector2(846f, 172f));
-        ConfigureUdpButton(row1, -315f);
-        CreateCameraButton(row1, -105f);
-        CreateRecordingButton(row1, 105f);
-        CreateDualFpsGauge(row1, 315f);
+            new Vector2(0f, 112f), new Vector2(846f, 172f));
+        ConfigureUdpButton(row1, -225f);
+        CreateCameraButton(row1, 0f);
+        CreateRecordingButton(row1, 225f);
 
         // 辅助控制行 Row 2 (Marker, 复位, 追踪诊断卡片)
         RectTransform row2 = Background(panel, "SecondaryToolbarRow",
-            new Vector2(0f, -118f), new Vector2(846f, 126f));
+            new Vector2(0f, -64f), new Vector2(846f, 126f));
         CreateMarkerButton(row2, -315f);
         CreateRoundButton(row2, "ResetInterfaceButton", "复位", "重置界面位置", -150f, ResetInterface);
         CreateTrackingDiagnosticCard(row2, 160f);
+
+        // 四路相机独立开关与各自帧率
+        cameraStreamRow = Background(panel, "CameraStreamToolbarRow",
+            new Vector2(0f, -205f), new Vector2(846f, 126f));
+        RebuildCameraStreamControls(true);
     }
 
     private void BuildHeader(RectTransform panel)
     {
         // 标题与版本徽标
         GameObject titleObj = PlainObject(panel, "HeaderTitleGroup");
-        ConfigureRect(titleObj.GetComponent<RectTransform>(), new Vector2(-280f, 178f), new Vector2(260f, 40f));
+        ConfigureRect(titleObj.GetComponent<RectTransform>(), new Vector2(-280f, 238f), new Vector2(260f, 40f));
         TMP_Text title = Label(titleObj.transform, "Brand", "HC-TELEOP", new Vector2(-30f, 0f),
             new Vector2(160f, 36f), 24f, TextAlignmentOptions.MidlineLeft, FontStyles.Bold);
         title.color = colorActiveCyan;
@@ -137,7 +145,7 @@ public class UdpTransmissionButton : MonoBehaviour
         statusText.transform.SetParent(panel, false);
         RectTransform rect = statusText.rectTransform;
         rect.anchorMin = rect.anchorMax = rect.pivot = new Vector2(0.5f, 0.5f);
-        rect.anchoredPosition = new Vector2(145f, 178f);
+        rect.anchoredPosition = new Vector2(145f, 238f);
         rect.sizeDelta = new Vector2(560f, 38f);
         statusText.raycastTarget = false;
         statusText.enableWordWrapping = false;
@@ -217,30 +225,6 @@ public class UdpTransmissionButton : MonoBehaviour
         recRing.transform.SetAsFirstSibling();
         recCaption = Label(obj.transform, "Caption", "按X录制 (Y停止)", new Vector2(0f, -76f),
             new Vector2(160f, 32f), 16f, TextAlignmentOptions.Center, FontStyles.Normal);
-    }
-
-    private void CreateDualFpsGauge(Transform row, float x)
-    {
-        GameObject obj = PlainObject(row, "DualFpsGaugeCard");
-        ConfigureRect(obj.GetComponent<RectTransform>(), new Vector2(x, 0f), new Vector2(180f, 150f));
-
-        // 应用帧率
-        GameObject appObj = PlainObject(obj.transform, "AppFpsPart");
-        ConfigureRect(appObj.GetComponent<RectTransform>(), new Vector2(-44f, 12f), new Vector2(80f, 80f));
-        appFpsRing = Ring(appObj.transform, "Ring", 76f, colorNeutralRing);
-        appFpsValue = Label(appObj.transform, "Value", "--", Vector2.zero, new Vector2(70f, 40f),
-            22f, TextAlignmentOptions.Center, FontStyles.Bold);
-        Label(appObj.transform, "Caption", "应用FPS", new Vector2(0f, -60f), new Vector2(80f, 26f),
-            14f, TextAlignmentOptions.Center, FontStyles.Normal);
-
-        // 相机帧率
-        GameObject camObj = PlainObject(obj.transform, "CamFpsPart");
-        ConfigureRect(camObj.GetComponent<RectTransform>(), new Vector2(44f, 12f), new Vector2(80f, 80f));
-        cameraFpsRing = Ring(camObj.transform, "Ring", 76f, colorNeutralRing);
-        cameraFpsValue = Label(camObj.transform, "Value", "--", Vector2.zero, new Vector2(70f, 40f),
-            22f, TextAlignmentOptions.Center, FontStyles.Bold);
-        Label(camObj.transform, "Caption", "相机FPS", new Vector2(0f, -60f), new Vector2(80f, 26f),
-            14f, TextAlignmentOptions.Center, FontStyles.Normal);
     }
 
     private void CreateMarkerButton(Transform row, float x)
@@ -562,13 +546,156 @@ public class UdpTransmissionButton : MonoBehaviour
         return state;
     }
 
+    private void RebuildCameraStreamControls(bool force = false)
+    {
+        if (cameraStreamRow == null)
+            return;
+
+        string[] streamIds = multiCameraManager != null
+            ? multiCameraManager.StreamIds
+            : Array.Empty<string>();
+        string signature = string.Join("|", streamIds);
+        if (!force && signature == cameraStreamSignature)
+            return;
+
+        cameraStreamSignature = signature;
+        cameraStreamRings.Clear();
+        cameraStreamValues.Clear();
+        cameraStreamCaptions.Clear();
+
+        for (int index = cameraStreamRow.childCount - 1; index >= 0; index--)
+            Destroy(cameraStreamRow.GetChild(index).gameObject);
+
+        Label(cameraStreamRow, "CameraStripTitle", "相机窗口",
+            new Vector2(-365f, 36f), new Vector2(100f, 28f),
+            15f, TextAlignmentOptions.MidlineLeft, FontStyles.Bold).color =
+            colorTextMuted;
+
+        if (streamIds.Length == 0)
+        {
+            Label(cameraStreamRow, "WaitingForStreams", "正在发现相机…",
+                Vector2.zero, new Vector2(420f, 34f), 17f,
+                TextAlignmentOptions.Center, FontStyles.Normal).color =
+                colorTextMuted;
+            return;
+        }
+
+        int shownCount = Mathf.Min(4, streamIds.Length);
+        float spacing = 180f;
+        float startX = -spacing * (shownCount - 1) * 0.5f;
+        for (int index = 0; index < shownCount; index++)
+        {
+            string streamId = streamIds[index];
+            string displayName = multiCameraManager.GetStreamDisplayName(streamId);
+            string shortName = GetShortCameraName(streamId, displayName);
+
+            GameObject obj = ButtonObject(
+                cameraStreamRow,
+                "CameraStreamButton_" + streamId);
+            ConfigureRect(obj.GetComponent<RectTransform>(),
+                new Vector2(startX + index * spacing, 12f),
+                new Vector2(68f, 68f));
+            SetCircleImage(obj.GetComponent<Image>());
+
+            Button button = obj.GetComponent<Button>();
+            button.targetGraphic = obj.GetComponent<Image>();
+            SetButtonColors(button);
+            button.onClick.RemoveAllListeners();
+            button.onClick.AddListener(() =>
+            {
+                if (multiCameraManager != null)
+                    multiCameraManager.ToggleStream(streamId);
+                RefreshPanel();
+            });
+
+            Label(obj.transform, "Name", shortName,
+                new Vector2(0f, 13f), new Vector2(58f, 22f), 13f,
+                TextAlignmentOptions.Center, FontStyles.Bold).color =
+                colorTextMuted;
+            TMP_Text fpsValue = Label(obj.transform, "Fps", "--",
+                new Vector2(0f, -10f), new Vector2(58f, 28f), 20f,
+                TextAlignmentOptions.Center, FontStyles.Bold);
+            Image ring = Ring(obj.transform, "Ring", 82f, colorNeutralRing);
+            ring.transform.SetAsFirstSibling();
+            TMP_Text caption = Label(obj.transform, "Caption", "显示",
+                new Vector2(0f, -48f), new Vector2(150f, 26f), 15f,
+                TextAlignmentOptions.Center, FontStyles.Normal);
+
+            cameraStreamRings[streamId] = ring;
+            cameraStreamValues[streamId] = fpsValue;
+            cameraStreamCaptions[streamId] = caption;
+        }
+    }
+
+    private static string GetShortCameraName(string streamId, string displayName)
+    {
+        string id = (streamId ?? string.Empty).ToLowerInvariant();
+        if (id.Contains("head")) return "头部";
+        if (id.Contains("over") || id.Contains("top")) return "俯视";
+        if (id.Contains("left")) return "左腕";
+        if (id.Contains("right")) return "右腕";
+        if (!string.IsNullOrEmpty(displayName))
+            return displayName.Length > 4
+                ? displayName.Substring(0, 4)
+                : displayName;
+        return "CAM";
+    }
+
+    private void RefreshCameraStreamControls()
+    {
+        RebuildCameraStreamControls();
+        if (multiCameraManager == null)
+            return;
+
+        foreach (string streamId in multiCameraManager.StreamIds)
+        {
+            bool visible = multiCameraManager.IsStreamVisible(streamId);
+            bool connected = multiCameraManager.IsStreamConnected(streamId);
+            float fps = multiCameraManager.GetStreamFps(streamId);
+
+            if (cameraStreamRings.TryGetValue(streamId, out Image ring))
+                ring.color = !visible
+                    ? colorNeutralRing
+                    : connected ? colorActiveCyan : colorWarningAmber;
+            if (cameraStreamValues.TryGetValue(streamId, out TMP_Text value))
+            {
+                value.text = fps > 0f ? fps.ToString("F0") : "--";
+                value.color = connected ? colorActiveCyan : Color.white;
+            }
+            if (cameraStreamCaptions.TryGetValue(streamId, out TMP_Text caption))
+                caption.text = visible ? "点击隐藏" : "点击显示";
+        }
+    }
+
     private void ToggleCamera()
     {
+        EnsureMultiCameraManager();
+        if (multiCameraManager != null)
+        {
+            multiCameraManager.ToggleAllVisible();
+        }
+        else
+        {
+            if (videoViewer == null)
+                videoViewer = FindObjectOfType<CameraFrameViewer>(true);
+            if (videoViewer != null)
+                videoViewer.SetWindowVisible(!videoViewer.IsWindowVisible);
+        }
+        RefreshPanel();
+    }
+
+    private void EnsureMultiCameraManager()
+    {
+        if (multiCameraManager == null)
+            multiCameraManager = FindObjectOfType<MultiCameraDisplayManager>(true);
         if (videoViewer == null)
             videoViewer = FindObjectOfType<CameraFrameViewer>(true);
-        if (videoViewer != null)
-            videoViewer.SetWindowVisible(!videoViewer.IsWindowVisible);
-        RefreshPanel();
+
+        if (multiCameraManager == null && videoViewer != null)
+            multiCameraManager = gameObject.AddComponent<MultiCameraDisplayManager>();
+
+        if (multiCameraManager != null)
+            multiCameraManager.Configure(videoViewer, poseSender);
     }
 
     private void ToggleMarkers()
@@ -624,15 +751,7 @@ public class UdpTransmissionButton : MonoBehaviour
 
     private void Update()
     {
-        fpsFrameCount++;
-        fpsTimer += Time.unscaledDeltaTime;
         refreshTimer += Time.unscaledDeltaTime;
-        if (fpsTimer >= 0.5f)
-        {
-            displayedFps = fpsFrameCount / fpsTimer;
-            fpsFrameCount = 0;
-            fpsTimer = 0f;
-        }
         if (refreshTimer >= statusRefreshInterval)
         {
             refreshTimer = 0f;
@@ -674,6 +793,7 @@ public class UdpTransmissionButton : MonoBehaviour
 
         if (videoViewer == null)
             videoViewer = FindObjectOfType<CameraFrameViewer>(true);
+        EnsureMultiCameraManager();
         if (visualState == null)
             visualState = EnsureControllerVisualState();
 
@@ -707,14 +827,25 @@ public class UdpTransmissionButton : MonoBehaviour
             udpIcon.color = poseSender.IsTransmissionEnabled ? colorActiveGreen : Color.white;
 
         // 3. CAM 相机控制状态
-        bool cameraVisible = videoViewer != null && videoViewer.IsWindowVisible;
-        bool cameraConnected = videoViewer != null && videoViewer.IsVideoConnected;
+        int cameraCount = multiCameraManager != null
+            ? multiCameraManager.CameraCount
+            : (videoViewer != null ? 1 : 0);
+        int connectedCameras = multiCameraManager != null
+            ? multiCameraManager.ConnectedCount
+            : (videoViewer != null && videoViewer.IsVideoConnected ? 1 : 0);
+        bool cameraVisible = multiCameraManager != null
+            ? multiCameraManager.AllVisible
+            : videoViewer != null && videoViewer.IsWindowVisible;
+        bool cameraConnected = connectedCameras > 0;
         Color camColor = cameraConnected ? colorActiveCyan : cameraVisible ? colorWarningAmber : colorOffRed;
         if (cameraRing != null) cameraRing.color = camColor;
         if (cameraCaption != null)
-            cameraCaption.text = cameraVisible ? "关闭相机" : "开启相机";
+            cameraCaption.text = cameraVisible
+                ? "关闭 " + Mathf.Max(cameraCount, 1) + " 路相机"
+                : "开启 " + Mathf.Max(cameraCount, 1) + " 路相机";
         if (cameraIcon != null)
             cameraIcon.color = cameraConnected ? colorActiveCyan : Color.white;
+        RefreshCameraStreamControls();
 
         // 4. REC 数据集录制控制状态 (呼吸灯与计时)
         if (recRing != null && recCaption != null && recIcon != null)
@@ -741,25 +872,13 @@ public class UdpTransmissionButton : MonoBehaviour
             }
         }
 
-        // 5. 帧率仪表
-        if (appFpsValue != null)
-            appFpsValue.text = displayedFps > 0f ? displayedFps.ToString("F0") : "--";
-        if (appFpsRing != null)
-            appFpsRing.color = displayedFps >= 70f ? colorActiveGreen : displayedFps >= 45f ? colorWarningAmber : colorOffRed;
-
-        if (cameraFpsValue != null)
-            cameraFpsValue.text = videoViewer != null && videoViewer.DisplayedVideoFps > 0f
-                ? videoViewer.DisplayedVideoFps.ToString("F0") : "--";
-        if (cameraFpsRing != null)
-            cameraFpsRing.color = cameraConnected ? colorActiveCyan : colorNeutralRing;
-
-        // 6. XYZ Marker 状态
+        // 5. XYZ Marker 状态
         bool markers = visualState == null || visualState.MarkersRequested;
         if (markerRing != null) markerRing.color = markers ? colorActiveGreen : colorNeutralRing;
         if (markerCaption != null)
             markerCaption.text = markers ? "隐藏 Marker" : "显示 Marker";
 
-        // 7. 空间设备追踪诊断 (独立状态灯)
+        // 6. 空间设备追踪诊断 (独立状态灯)
         if (headStatusDot != null)
             headStatusDot.color = poseSender.headTracked ? colorActiveGreen : colorWarningAmber;
         if (leftStatusDot != null)

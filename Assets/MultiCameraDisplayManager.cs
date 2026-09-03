@@ -40,10 +40,14 @@ public class MultiCameraDisplayManager : MonoBehaviour
         new Dictionary<string, CameraFrameViewer>();
     private readonly Dictionary<string, bool> requestedVisibility =
         new Dictionary<string, bool>();
+    private readonly HashSet<string> manualVisibilityOverrides = new HashSet<string>();
+    private readonly HashSet<string> autoOpenedStreams = new HashSet<string>();
     private readonly List<string> streamOrder = new List<string>();
     private Coroutine discoveryCoroutine;
     private string configuredServerIp = string.Empty;
-    private bool allVisible = true;
+    private bool allVisible;
+    private bool userSetAllVisibility;
+    private bool initialVisibilityApplied;
     private bool hasLayoutCenter;
     private Vector2 layoutCenter;
 
@@ -79,6 +83,7 @@ public class MultiCameraDisplayManager : MonoBehaviour
         poseSender = sender;
         if (templateViewer != null && viewers.Count == 0)
             viewers[templateViewer.StreamId] = templateViewer;
+        ApplyInitialHiddenState();
     }
 
     private void Awake()
@@ -89,6 +94,7 @@ public class MultiCameraDisplayManager : MonoBehaviour
             templateViewer = FindObjectOfType<CameraFrameViewer>(true);
         if (templateViewer != null)
             viewers[templateViewer.StreamId] = templateViewer;
+        ApplyInitialHiddenState();
     }
 
     private void OnEnable()
@@ -108,8 +114,10 @@ public class MultiCameraDisplayManager : MonoBehaviour
     public void SetAllVisible(bool visible)
     {
         allVisible = visible;
+        userSetAllVisibility = true;
         foreach (KeyValuePair<string, CameraFrameViewer> pair in viewers)
         {
+            manualVisibilityOverrides.Add(pair.Key);
             requestedVisibility[pair.Key] = visible;
             if (pair.Value != null)
                 pair.Value.SetWindowVisible(visible);
@@ -132,6 +140,7 @@ public class MultiCameraDisplayManager : MonoBehaviour
             return;
 
         requestedVisibility[streamId] = visible;
+        manualVisibilityOverrides.Add(streamId);
         if (viewers.TryGetValue(streamId, out CameraFrameViewer viewer) &&
             viewer != null)
         {
@@ -139,6 +148,15 @@ public class MultiCameraDisplayManager : MonoBehaviour
         }
 
         allVisible = AllVisible;
+    }
+
+    private void ApplyInitialHiddenState()
+    {
+        if (initialVisibilityApplied || templateViewer == null)
+            return;
+        initialVisibilityApplied = true;
+        requestedVisibility[templateViewer.StreamId] = false;
+        templateViewer.SetWindowVisible(false);
     }
 
     public bool IsStreamVisible(string streamId)
@@ -313,8 +331,22 @@ public class MultiCameraDisplayManager : MonoBehaviour
             CameraFrameViewer viewer = pair.Value;
             if (!requestedVisibility.TryGetValue(pair.Key, out bool visible))
             {
-                visible = allVisible;
+                visible = userSetAllVisibility && allVisible;
                 requestedVisibility[pair.Key] = visible;
+            }
+
+            CameraStreamInfo stream = validStreams.FirstOrDefault(item =>
+                item.id == pair.Key);
+            bool hasActualFrames = stream != null && stream.capture_fps > 0.2f;
+            if (!manualVisibilityOverrides.Contains(pair.Key) &&
+                !autoOpenedStreams.Contains(pair.Key) && hasActualFrames)
+            {
+                // On a fresh app launch the camera panels remain hidden.  A
+                // stream is opened once only after the middleware reports
+                // actual captured frames, not merely a running service.
+                visible = true;
+                requestedVisibility[pair.Key] = true;
+                autoOpenedStreams.Add(pair.Key);
             }
             viewer.SetWindowVisible(visible);
             if (forceRestart && visible)

@@ -123,16 +123,15 @@ public class UdpTransmissionButton : MonoBehaviour
 
     private void BuildHeader(RectTransform panel)
     {
-        // 标题与版本徽标
+        // 标题；旧版运行时生成的版本徽标也要隐藏，避免场景中残留。
         GameObject titleObj = PlainObject(panel, "HeaderTitleGroup");
         ConfigureRect(titleObj.GetComponent<RectTransform>(), new Vector2(-280f, 238f), new Vector2(260f, 40f));
         TMP_Text title = Label(titleObj.transform, "Brand", "HC-TELEOP", new Vector2(-30f, 0f),
             new Vector2(160f, 36f), 24f, TextAlignmentOptions.MidlineLeft, FontStyles.Bold);
         title.color = colorActiveCyan;
-
-        TMP_Text tag = Label(titleObj.transform, "Tag", "v2.3 真机遥操作", new Vector2(85f, -1f),
-            new Vector2(120f, 26f), 14f, TextAlignmentOptions.MidlineLeft, FontStyles.Normal);
-        tag.color = colorTextMuted;
+        Transform legacyTag = titleObj.transform.Find("Tag");
+        if (legacyTag != null)
+            legacyTag.gameObject.SetActive(false);
 
         ConfigureStatusText(panel);
     }
@@ -814,7 +813,20 @@ public class UdpTransmissionButton : MonoBehaviour
             {
                 recInfo = "   <color=#00C7FF>[" + poseSender.LastRecordingMessage + "]</color>";
             }
-            statusText.text = "PICO  " + poseSender.LocalIpAddress + "  ⇄  PC  " + pc + recInfo;
+            string replayInfo = "";
+            if (poseSender.ReplayRequiresReset)
+            {
+                replayInfo = "   <color=#FFB826>[重放结束，请按 A 恢复遥操作]</color>";
+            }
+            else if (poseSender.ReplayState == "playing")
+            {
+                replayInfo = "   <color=#B388FF>[重放中]</color>";
+            }
+            else if (poseSender.ReplayState == "paused")
+            {
+                replayInfo = "   <color=#FFB826>[重放已暂停]</color>";
+            }
+            statusText.text = "PICO  " + poseSender.LocalIpAddress + "  ⇄  PC  " + pc + recInfo + replayInfo;
         }
 
         // 2. UDP 传输控制状态

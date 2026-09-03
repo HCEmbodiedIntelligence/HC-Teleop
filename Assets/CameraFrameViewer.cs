@@ -72,7 +72,9 @@ public class CameraFrameViewer : MonoBehaviour
     private bool hasObservedTransportProgress;
     private bool connectionNeedsRestart;
     private CanvasGroup videoWindowCanvasGroup;
-    private bool isWindowVisible = true;
+    // Start fully hidden. MultiCameraDisplayManager opens a stream once only
+    // after middleware reports a non-zero capture FPS, or when the user opens it.
+    private bool isWindowVisible;
     private bool statsWarningLogged;
     private static Coroutine sharedWebRtcUpdateCoroutine;
     private static CameraFrameViewer sharedWebRtcUpdateOwner;
@@ -134,6 +136,7 @@ public class CameraFrameViewer : MonoBehaviour
                 videoStatusText = targetImage.GetComponentInChildren<TMP_Text>(true);
         }
 
+        SetWindowVisible(false);
         UpdateVideoPanelLayout();
     }
 

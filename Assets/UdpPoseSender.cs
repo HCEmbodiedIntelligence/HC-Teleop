@@ -4,16 +4,20 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using UnityEngine;
 using UnityEngine.XR;
 
 [Serializable]
 public class MiddlewareEventJson
 {
+    public string kind;
     public string type;
     public string source;
     public double timestamp;
     public MiddlewareEventPayload payload;
+
+    public string EventKind => !string.IsNullOrEmpty(kind) ? kind : type;
 }
 
 [Serializable]
@@ -25,6 +29,10 @@ public class MiddlewareEventPayload
     public string action;
     public string message;
     public string error;
+    public string state;
+    public bool requires_reset;
+    public bool marked;
+    public string marked_at;
 }
 
 public class UdpPoseSender : MonoBehaviour
@@ -60,6 +68,24 @@ public class UdpPoseSender : MonoBehaviour
         public Vector2 secondaryAxis;
     }
 
+    private struct PoseState
+    {
+        public Vector3 position;
+        public Quaternion rotation;
+    }
+
+    private struct PoseSnapshot
+    {
+        public long version;
+        public double timestamp;
+        public byte flags;
+        public PoseState head;
+        public PoseState left;
+        public PoseState right;
+        public ControllerInputState leftInput;
+        public ControllerInputState rightInput;
+    }
+
     [Header("自动发现 PC 接收端")]
     public int discoveryPort = 5006;
     public float receiverTimeoutSeconds = 6f;
@@ -92,8 +118,12 @@ public class UdpPoseSender : MonoBehaviour
     public string ActiveRecordingFile { get; private set; }
     public float RecordingStartTime { get; private set; }
     public string LastRecordingMessage { get; private set; }
+    public string ReplayState { get; private set; } = "idle";
+    public bool ReplayRequiresReset { get; private set; }
+    public string LastReplayMessage { get; private set; }
 
     public event Action<bool, string> RecordingStateChanged;
+    public event Action<string, bool, string> ReplayStateChanged;
 
     private UdpClient eventClient;
 
@@ -108,7 +138,7 @@ public class UdpPoseSender : MonoBehaviour
 
     private UdpClient poseClient;
     private UdpClient discoveryClient;
-    private IPEndPoint receiverEndPoint;
+    private volatile IPEndPoint receiverEndPoint;
     private double nextSendTime;
     private double nextDiscoveryTime;
     private double lastReceiverReplyTime = double.NegativeInfinity;
@@ -122,6 +152,15 @@ public class UdpPoseSender : MonoBehaviour
     private ushort previousRightButtons;
     private bool leftInputInitialized;
     private bool rightInputInitialized;
+    private readonly object poseSnapshotLock = new object();
+    private readonly object poseSendLock = new object();
+    private PoseSnapshot latestPoseSnapshot;
+    private bool hasPoseSnapshot;
+    private long latestPoseVersion;
+    private Thread poseSendThread;
+    private volatile bool poseSendThreadStopping;
+    private volatile bool poseSenderActive;
+    private volatile bool poseSenderSuspended;
 
     public bool IsTransmissionEnabled => transmissionEnabled;
     public bool HasReceiver => receiverEndPoint != null;
@@ -174,6 +213,8 @@ public class UdpPoseSender : MonoBehaviour
             nextDiscoveryTime = now;
             nextIpRefreshTime = now;
             RefreshLocalIp();
+            StartPoseSendThread();
+            poseSenderActive = transmissionEnabled;
             Debug.Log("UDP initialized. Searching for a PC receiver...");
         }
         catch (Exception exception)
@@ -231,8 +272,8 @@ public class UdpPoseSender : MonoBehaviour
         rateMeasureTimer += Time.unscaledDeltaTime;
         if (rateMeasureTimer >= 0.5)
         {
-            currentSendRateHz = (float)(sentPacketsCounter / rateMeasureTimer);
-            sentPacketsCounter = 0;
+            int packets = Interlocked.Exchange(ref sentPacketsCounter, 0);
+            currentSendRateHz = (float)(packets / rateMeasureTimer);
             rateMeasureTimer = 0;
         }
 
@@ -261,20 +302,7 @@ public class UdpPoseSender : MonoBehaviour
             return;
 
         double now = Time.realtimeSinceStartupAsDouble;
-        double interval = 1.0 / sendRateHz;
-        if (now < nextSendTime)
-            return;
-
-        while (now >= nextSendTime)
-        {
-            SendPosePacket(now);
-            nextSendTime += interval;
-            if (now - nextSendTime > 0.25)
-            {
-                nextSendTime = now + interval;
-                break;
-            }
-        }
+        CaptureLatestPoseSnapshot(now);
     }
 
     private void SendDiscoveryRequest()
@@ -442,49 +470,91 @@ public class UdpPoseSender : MonoBehaviour
 
     private void HandleMiddlewareEvent(MiddlewareEventJson evt)
     {
-        if (evt == null)
+        if (evt == null || evt.payload == null)
             return;
 
-        if (evt.payload != null)
+        string eventKind = evt.EventKind ?? string.Empty;
+        MiddlewareEventPayload payload = evt.payload;
+
+        if (eventKind.StartsWith("replay_", StringComparison.Ordinal))
         {
-            if (!string.IsNullOrEmpty(evt.payload.error))
+            ReplayState = string.IsNullOrEmpty(payload.state) ? eventKind.Substring(7) : payload.state;
+            ReplayRequiresReset = payload.requires_reset;
+            LastReplayMessage = !string.IsNullOrEmpty(payload.error)
+                ? "重放错误: " + payload.error
+                : payload.message;
+            if (eventKind == "replay_reset")
             {
-                LastRecordingMessage = "错误: " + evt.payload.error;
+                ReplayState = "idle";
+                ReplayRequiresReset = false;
             }
-            else if (!string.IsNullOrEmpty(evt.payload.message))
-            {
-                LastRecordingMessage = evt.payload.message;
-            }
-
-            bool wasRecording = IsRecording;
-            bool targetRecording = evt.payload.recording;
-
-            if (evt.type == "record_started")
-                targetRecording = true;
-            else if (evt.type == "record_stopped")
-                targetRecording = false;
-
-            if (targetRecording != wasRecording || !string.IsNullOrEmpty(evt.payload.filename))
-            {
-                IsRecording = targetRecording;
-                if (IsRecording && !wasRecording)
-                {
-                    RecordingStartTime = Time.realtimeSinceStartup;
-                    ActiveRecordingFile = evt.payload.filename;
-                }
-                else if (!IsRecording)
-                {
-                    ActiveRecordingFile = null;
-                }
-
-                RecordingStateChanged?.Invoke(IsRecording, LastRecordingMessage);
-                NetworkStatusChanged?.Invoke();
-            }
-            else if (!string.IsNullOrEmpty(LastRecordingMessage))
-            {
-                NetworkStatusChanged?.Invoke();
-            }
+            ReplayStateChanged?.Invoke(ReplayState, ReplayRequiresReset, LastReplayMessage);
+            NetworkStatusChanged?.Invoke();
+            return;
         }
+
+        if (eventKind == "safety_resume" && ReplayRequiresReset)
+        {
+            ReplayState = "idle";
+            ReplayRequiresReset = false;
+            LastReplayMessage = "已恢复实时遥操作";
+            ReplayStateChanged?.Invoke(ReplayState, false, LastReplayMessage);
+            NetworkStatusChanged?.Invoke();
+            return;
+        }
+
+        if (!eventKind.StartsWith("recording_", StringComparison.Ordinal))
+            return;
+
+        LastRecordingMessage = !string.IsNullOrEmpty(payload.error)
+            ? "错误: " + payload.error
+            : payload.message;
+
+        if (eventKind == "recording_marked")
+        {
+            if (string.IsNullOrEmpty(LastRecordingMessage))
+                LastRecordingMessage = "已标记: " + payload.filename;
+            TriggerHapticImpulse(XRNode.LeftHand, 0.65f, 0.12f);
+            TriggerHapticImpulse(XRNode.RightHand, 0.65f, 0.12f);
+            RecordingStateChanged?.Invoke(IsRecording, LastRecordingMessage);
+            NetworkStatusChanged?.Invoke();
+            return;
+        }
+
+        bool wasRecording = IsRecording;
+        bool targetRecording = IsRecording;
+        bool hasRecordingState = false;
+        if (eventKind == "recording_started")
+        {
+            targetRecording = true;
+            hasRecordingState = true;
+        }
+        else if (eventKind == "recording_stopped")
+        {
+            targetRecording = false;
+            hasRecordingState = true;
+        }
+        else if (eventKind == "recording_status")
+        {
+            targetRecording = payload.recording;
+            hasRecordingState = true;
+        }
+
+        if (hasRecordingState)
+        {
+            IsRecording = targetRecording;
+            if (IsRecording && !wasRecording)
+            {
+                RecordingStartTime = Time.realtimeSinceStartup;
+                ActiveRecordingFile = payload.filename;
+            }
+            else if (!IsRecording)
+            {
+                ActiveRecordingFile = null;
+            }
+            RecordingStateChanged?.Invoke(IsRecording, LastRecordingMessage);
+        }
+        NetworkStatusChanged?.Invoke();
     }
 
     private void SendPosePacket(double timestamp, bool forceInvalidFlags = false)
@@ -493,6 +563,32 @@ public class UdpPoseSender : MonoBehaviour
         if (poseClient == null || target == null)
             return;
 
+        PoseSnapshot snapshot = BuildPoseSnapshot(timestamp, forceInvalidFlags);
+        SendPoseSnapshot(snapshot, target, true);
+        if (forceInvalidFlags)
+            ResetInputHistory();
+    }
+
+    private void CaptureLatestPoseSnapshot(double timestamp)
+    {
+        PoseSnapshot snapshot = BuildPoseSnapshot(timestamp, false);
+        lock (poseSnapshotLock)
+        {
+            snapshot.version = ++latestPoseVersion;
+            latestPoseSnapshot = snapshot;
+            hasPoseSnapshot = true;
+        }
+
+        // Edge bits belong to this sample.  The sender thread transmits them
+        // once, while held/analog state remains present in every packet.
+        leftInput.pressed = 0;
+        leftInput.released = 0;
+        rightInput.pressed = 0;
+        rightInput.released = 0;
+    }
+
+    private PoseSnapshot BuildPoseSnapshot(double timestamp, bool forceInvalidFlags)
+    {
         headTracked = head != null && IsTracked(XRNode.Head);
         leftTracked = leftController != null && IsTracked(XRNode.LeftHand);
         rightTracked = rightController != null && IsTracked(XRNode.RightHand);
@@ -505,49 +601,126 @@ public class UdpPoseSender : MonoBehaviour
             if (rightTracked) flags |= 4;
         }
 
+        return new PoseSnapshot
+        {
+            timestamp = timestamp,
+            flags = flags,
+            head = ReadPose(head),
+            left = ReadPose(leftController),
+            right = ReadPose(rightController),
+            leftInput = forceInvalidFlags ? default(ControllerInputState) : leftInput,
+            rightInput = forceInvalidFlags ? default(ControllerInputState) : rightInput
+        };
+    }
+
+    private void SendPoseSnapshot(
+        PoseSnapshot snapshot,
+        IPEndPoint target,
+        bool includeInputEdges)
+    {
+        ControllerInputState packetLeftInput = snapshot.leftInput;
+        ControllerInputState packetRightInput = snapshot.rightInput;
+        if (!includeInputEdges)
+        {
+            packetLeftInput.pressed = 0;
+            packetLeftInput.released = 0;
+            packetRightInput.pressed = 0;
+            packetRightInput.released = 0;
+        }
+
         try
         {
-            using (MemoryStream stream = new MemoryStream(192))
-            using (BinaryWriter writer = new BinaryWriter(stream))
+            lock (poseSendLock)
             {
-                writer.Write((byte)'P');
-                writer.Write((byte)'I');
-                writer.Write((byte)'C');
-                writer.Write((byte)'O');
-                writer.Write(ProtocolVersion);
-                writer.Write(sequence);
-                writer.Write(timestamp);
-                writer.Write(flags);
-                WritePose(writer, head);
-                WritePose(writer, leftController);
-                WritePose(writer, rightController);
-
-                if (forceInvalidFlags)
+                using (MemoryStream stream = new MemoryStream(192))
+                using (BinaryWriter writer = new BinaryWriter(stream))
                 {
-                    WriteControllerInput(writer, default(ControllerInputState));
-                    WriteControllerInput(writer, default(ControllerInputState));
-                }
-                else
-                {
-                    WriteControllerInput(writer, leftInput);
-                    WriteControllerInput(writer, rightInput);
-                }
+                    writer.Write((byte)'P');
+                    writer.Write((byte)'I');
+                    writer.Write((byte)'C');
+                    writer.Write((byte)'O');
+                    writer.Write(ProtocolVersion);
+                    writer.Write(sequence);
+                    writer.Write(snapshot.timestamp);
+                    writer.Write(snapshot.flags);
+                    WritePose(writer, snapshot.head);
+                    WritePose(writer, snapshot.left);
+                    WritePose(writer, snapshot.right);
+                    WriteControllerInput(writer, packetLeftInput);
+                    WriteControllerInput(writer, packetRightInput);
 
-                byte[] packet = stream.ToArray();
-                poseClient.Send(packet, packet.Length, target);
-                sentPacketsCounter++;
-                leftInput.pressed = 0;
-                leftInput.released = 0;
-                rightInput.pressed = 0;
-                rightInput.released = 0;
-                if (forceInvalidFlags)
-                    ResetInputHistory();
-                unchecked { sequence++; }
+                    byte[] packet = stream.ToArray();
+                    poseClient.Send(packet, packet.Length, target);
+                    Interlocked.Increment(ref sentPacketsCounter);
+                    unchecked { sequence++; }
+                }
             }
         }
         catch (Exception exception)
         {
             Debug.LogWarning("UDP send failed: " + exception.Message);
+        }
+    }
+
+    private void StartPoseSendThread()
+    {
+        poseSendThreadStopping = false;
+        poseSendThread = new Thread(PoseSendLoop)
+        {
+            IsBackground = true,
+            Name = "PICO UDP pose sender"
+        };
+        poseSendThread.Start();
+    }
+
+    private void PoseSendLoop()
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        double nextSendAt = clock.Elapsed.TotalSeconds;
+        long lastSentSnapshotVersion = -1;
+
+        while (!poseSendThreadStopping)
+        {
+            IPEndPoint target = receiverEndPoint;
+            float rate = sendRateHz;
+            if (!poseSenderActive || poseSenderSuspended || target == null ||
+                poseClient == null || rate <= 0f)
+            {
+                nextSendAt = clock.Elapsed.TotalSeconds;
+                Thread.Sleep(2);
+                continue;
+            }
+
+            double now = clock.Elapsed.TotalSeconds;
+            if (now < nextSendAt)
+            {
+                int sleepMilliseconds = Math.Max(
+                    1,
+                    (int)Math.Floor((nextSendAt - now) * 1000.0));
+                Thread.Sleep(sleepMilliseconds);
+                continue;
+            }
+
+            PoseSnapshot snapshot;
+            bool available;
+            lock (poseSnapshotLock)
+            {
+                snapshot = latestPoseSnapshot;
+                available = hasPoseSnapshot;
+            }
+
+            if (available)
+            {
+                bool includeEdges = snapshot.version != lastSentSnapshotVersion;
+                SendPoseSnapshot(snapshot, target, includeEdges);
+                lastSentSnapshotVersion = snapshot.version;
+            }
+
+            double interval = 1.0 / Math.Max(1.0, rate);
+            nextSendAt += interval;
+            now = clock.Elapsed.TotalSeconds;
+            if (now - nextSendAt > 0.1)
+                nextSendAt = now + interval;
         }
     }
 
@@ -676,7 +849,7 @@ public class UdpPoseSender : MonoBehaviour
         rightInputInitialized = false;
     }
 
-    private void WritePose(BinaryWriter writer, Transform target)
+    private PoseState ReadPose(Transform target)
     {
         Vector3 position = Vector3.zero;
         Quaternion rotation = Quaternion.identity;
@@ -695,13 +868,22 @@ public class UdpPoseSender : MonoBehaviour
             }
         }
 
-        writer.Write(position.x);
-        writer.Write(position.y);
-        writer.Write(position.z);
-        writer.Write(rotation.x);
-        writer.Write(rotation.y);
-        writer.Write(rotation.z);
-        writer.Write(rotation.w);
+        return new PoseState
+        {
+            position = position,
+            rotation = rotation
+        };
+    }
+
+    private static void WritePose(BinaryWriter writer, PoseState pose)
+    {
+        writer.Write(pose.position.x);
+        writer.Write(pose.position.y);
+        writer.Write(pose.position.z);
+        writer.Write(pose.rotation.x);
+        writer.Write(pose.rotation.y);
+        writer.Write(pose.rotation.z);
+        writer.Write(pose.rotation.w);
     }
 
     private bool IsTracked(XRNode node)
@@ -800,11 +982,13 @@ public class UdpPoseSender : MonoBehaviour
     {
         if (paused)
         {
+            poseSenderSuspended = true;
             if (transmissionEnabled)
                 SendPosePacket(Time.realtimeSinceStartupAsDouble, true);
             return;
         }
 
+        poseSenderSuspended = false;
         double now = Time.realtimeSinceStartupAsDouble;
         nextSendTime = now;
         nextDiscoveryTime = now;
@@ -815,8 +999,14 @@ public class UdpPoseSender : MonoBehaviour
 
     private void CloseUdp(bool sendStopPacket)
     {
+        poseSenderActive = false;
         if (sendStopPacket && transmissionEnabled)
             SendPosePacket(Time.realtimeSinceStartupAsDouble, true);
+
+        poseSendThreadStopping = true;
+        if (poseSendThread != null && poseSendThread.IsAlive)
+            poseSendThread.Join(500);
+        poseSendThread = null;
 
         try { poseClient?.Close(); } catch { }
         try { eventClient?.Close(); } catch { }
@@ -851,13 +1041,18 @@ public class UdpPoseSender : MonoBehaviour
             return;
 
         if (!enabled)
+        {
+            poseSenderActive = false;
             SendPosePacket(Time.realtimeSinceStartupAsDouble, true);
+        }
 
         transmissionEnabled = enabled;
         if (transmissionEnabled)
         {
             ResetInputHistory();
             nextSendTime = Time.realtimeSinceStartupAsDouble;
+            CaptureLatestPoseSnapshot(nextSendTime);
+            poseSenderActive = true;
             GripDraggablePanel.EndAllDrags();
         }
         else

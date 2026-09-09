@@ -29,10 +29,52 @@ public class MiddlewareEventPayload
     public string action;
     public string message;
     public string error;
+    public string reason;
     public string state;
     public bool requires_reset;
     public bool marked;
     public string marked_at;
+}
+
+public sealed class MiddlewareSafetyState
+{
+    public bool IsEmergencyStopped { get; private set; }
+    public string EmergencyStopReason { get; private set; }
+    private double lastSafetyTimestamp = double.NegativeInfinity;
+
+    public string EmergencyStopMessage
+    {
+        get
+        {
+            string reason = EmergencyStopReason ?? string.Empty;
+            if (reason.StartsWith("no VR pose data for ", StringComparison.Ordinal))
+                return "VR 数据超时：" + reason.Substring(20);
+            if (reason.StartsWith("VR pose sample stale for ", StringComparison.Ordinal))
+                return "VR 位姿采样停滞：" + reason.Substring(25);
+            if (reason == "head tracking invalid")
+                return "头显追踪丢失";
+            return string.IsNullOrEmpty(reason) ? "中间件触发急停" : reason;
+        }
+    }
+
+    public bool Apply(MiddlewareEventJson evt)
+    {
+        if (evt == null || evt.payload == null)
+            return false;
+        string kind = evt.EventKind;
+        if (kind != "safety_stop" && kind != "safety_resume")
+            return false;
+        // Ignore delayed UDP events; only middleware confirmation clears the latch.
+        if (evt.timestamp > 0 && evt.timestamp < lastSafetyTimestamp)
+            return false;
+        if (evt.timestamp > 0)
+            lastSafetyTimestamp = evt.timestamp;
+        IsEmergencyStopped = kind == "safety_stop";
+        EmergencyStopReason = IsEmergencyStopped
+            ? (!string.IsNullOrEmpty(evt.payload.reason) ? evt.payload.reason : evt.payload.message)
+            : null;
+        return true;
+    }
 }
 
 public class UdpPoseSender : MonoBehaviour
@@ -121,7 +163,10 @@ public class UdpPoseSender : MonoBehaviour
     public string ReplayState { get; private set; } = "idle";
     public bool ReplayRequiresReset { get; private set; }
     public string LastReplayMessage { get; private set; }
-
+    private readonly MiddlewareSafetyState safetyState = new MiddlewareSafetyState();
+    public bool IsEmergencyStopped => safetyState.IsEmergencyStopped;
+    public string EmergencyStopReason => safetyState.EmergencyStopReason;
+    public string EmergencyStopMessage => safetyState.EmergencyStopMessage;
     public event Action<bool, string> RecordingStateChanged;
     public event Action<string, bool, string> ReplayStateChanged;
 
@@ -186,6 +231,8 @@ public class UdpPoseSender : MonoBehaviour
         {
             if (!string.IsNullOrEmpty(initializationError))
                 return "UDP 初始化失败: " + initializationError;
+            if (IsEmergencyStopped)
+                return "急停：" + EmergencyStopMessage;
             if (!HasReceiver)
                 return transmissionEnabled ? "等待 PC，发现后自动发送" : "正在搜索 PC 接收端";
             return transmissionEnabled ? "正在传输位姿" : "已发现 PC，传输已关闭";
@@ -493,12 +540,19 @@ public class UdpPoseSender : MonoBehaviour
             return;
         }
 
-        if (eventKind == "safety_resume" && ReplayRequiresReset)
+        if (eventKind == "safety_stop" || eventKind == "safety_resume")
         {
-            ReplayState = "idle";
-            ReplayRequiresReset = false;
-            LastReplayMessage = "已恢复实时遥操作";
-            ReplayStateChanged?.Invoke(ReplayState, false, LastReplayMessage);
+            if (!safetyState.Apply(evt))
+                return;
+            // Keep sending input so A can reach the middleware's resume handler.
+            // A local transmission toggle or recovered tracking must not clear this state.
+            if (!IsEmergencyStopped && ReplayRequiresReset)
+            {
+                ReplayState = "idle";
+                ReplayRequiresReset = false;
+                LastReplayMessage = "已恢复实时遥操作";
+                ReplayStateChanged?.Invoke(ReplayState, false, LastReplayMessage);
+            }
             NetworkStatusChanged?.Invoke();
             return;
         }

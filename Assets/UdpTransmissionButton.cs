@@ -24,6 +24,8 @@ public class UdpTransmissionButton : MonoBehaviour
     private Image udpRing;
     private TMP_Text udpCaption;
     private TMP_Text udpIcon;
+    private RectTransform emergencyBanner;
+    private TMP_Text emergencyText;
 
     private Image cameraRing;
     private TMP_Text cameraCaption;
@@ -100,6 +102,17 @@ public class UdpTransmissionButton : MonoBehaviour
 
         // 顶部品牌与状态栏 (Header Bar)
         BuildHeader(panel);
+        emergencyBanner = Background(panel, "EmergencyStopBanner",
+            new Vector2(0f, 330f), new Vector2(846f, 90f));
+        emergencyBanner.GetComponent<Image>().color = new Color(0.55f, 0.025f, 0.05f, 0.98f);
+        emergencyText = Label(emergencyBanner, "EmergencyStopText", "", Vector2.zero,
+            new Vector2(814f, 80f), 24f, TextAlignmentOptions.Center, FontStyles.Bold);
+        emergencyText.richText = false;
+        emergencyText.enableWordWrapping = true;
+        emergencyText.enableAutoSizing = true;
+        emergencyText.fontSizeMin = 16f;
+        emergencyText.fontSizeMax = 24f;
+        emergencyBanner.gameObject.SetActive(false);
 
         // 主控制行 Row 1 (UDP, 相机, 录制)
         RectTransform row1 = Background(panel, "PrimaryToolbarRow",
@@ -830,13 +843,24 @@ public class UdpTransmissionButton : MonoBehaviour
         }
 
         // 2. UDP 传输控制状态
-        Color udpColor = !poseSender.IsTransmissionEnabled
+        bool emergencyStopped = poseSender.IsEmergencyStopped;
+        if (emergencyBanner != null)
+            emergencyBanner.gameObject.SetActive(emergencyStopped);
+        if (emergencyText != null && emergencyStopped)
+            emergencyText.text = "急停：" + poseSender.EmergencyStopMessage
+                + "\n" + (poseSender.HasReceiver ? "排除故障后按 A 恢复，等待中间件确认" : "连接已断开，等待中间件重新连接并确认恢复");
+        Color udpColor = emergencyStopped ? colorActiveRed : !poseSender.IsTransmissionEnabled
             ? colorOffRed : poseSender.HasReceiver ? colorActiveGreen : colorWarningAmber;
         if (udpRing != null) udpRing.color = udpColor;
         if (udpCaption != null)
-            udpCaption.text = poseSender.IsTransmissionEnabled ? "按B关闭 (UDP)" : "按A开启 (UDP)";
+            udpCaption.text = emergencyStopped ? "已急停 / 按A恢复" : poseSender.IsTransmissionEnabled ? "按B关闭 (UDP)" : "按A开启 (UDP)";
+        if (udpCaption != null)
+            udpCaption.color = emergencyStopped ? colorActiveRed : Color.white;
         if (udpIcon != null)
-            udpIcon.color = poseSender.IsTransmissionEnabled ? colorActiveGreen : Color.white;
+        {
+            udpIcon.text = emergencyStopped ? "急停" : "UDP";
+            udpIcon.color = emergencyStopped ? colorActiveRed : poseSender.IsTransmissionEnabled ? colorActiveGreen : Color.white;
+        }
 
         // 3. CAM 相机控制状态
         int cameraCount = multiCameraManager != null

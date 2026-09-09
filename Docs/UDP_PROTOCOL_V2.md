@@ -57,3 +57,55 @@ When transmission stops, the app pauses, or tracking becomes invalid, tracking
 flags and controller inputs are zeroed. The receiver must stop the corresponding
 robot arm whenever its tracking flag is invalid and must stop the robot if no new
 packet arrives for more than 200 ms.
+
+## Middleware emergency-stop feedback (UDP 5007)
+
+The headset listens on `UdpPoseSender.inboundEventPort` (default 5007) for UTF-8
+JSON events already emitted by the middleware:
+
+```json
+{"kind":"safety_stop","source":"middleware","timestamp":1750000000.1,"payload":{"reason":"no VR pose data for 201 ms"}}
+```
+
+`safety_stop` latches a red emergency-stop banner above the headset control panel
+and changes the UDP indicator to red with the text `急停`. Timeout, stale pose
+sample, and invalid head tracking reasons are displayed in Chinese. Other reasons
+are displayed as provided. `payload.message` is a fallback for a missing reason.
+
+```json
+{"kind":"safety_resume","source":"middleware","timestamp":1750000001.2,"payload":{"reason":"VR controller A button pressed"}}
+```
+
+Only `safety_resume` clears the indicator. Tracking recovery, discovery replies,
+recording/replay events, and local UDP toggles do not clear it. Pose/input traffic
+continues while enabled so the middleware can receive the A-button resume request.
+The display waits for the middleware confirmation; pressing A does not locally
+acknowledge the stop. The existing replay-reset acknowledgement is preserved.
+
+`type` is accepted as an alias for `kind`. Positive middleware timestamps order
+safety events; an older event cannot overwrite a newer stop/resume state. Events
+without timestamps remain supported. This is UI feedback, not an additional
+robot-side safety controller.
+
+### Verification
+
+1. Install a newly built headset app, connect to the middleware, and enable UDP.
+2. Interrupt pose traffic while keeping PC-to-headset UDP 5007 reachable. Confirm
+   the middleware stop and the headset's red banner show the timeout reason.
+3. Restore pose traffic. The banner must remain until a middleware resume event.
+4. Press A after resolving the fault, or resume from the middleware dashboard.
+   Confirm the banner clears only when the resume event arrives.
+5. Repeat with stale samples and head-tracking loss. Check that recording and
+   replay status changes cannot hide the emergency-stop banner.
+
+`Tools/SafetyStateRegression.cs` tests the managed safety state without XR hardware.
+Compile it as a console executable, then run using Unity's bundled `mono.exe`,
+passing the freshly compiled project DLL and the Editor's
+`Data/Managed/UnityEngine` directory. This does not test actual UDP delivery or UI
+rendering.
+
+The existing middleware sends stop/resume as individual UDP events. Delivery is
+not guaranteed during packet loss or a disconnected return path; reliable
+reconciliation after such a loss requires periodic middleware safety snapshots or
+an acknowledgement/retry protocol. This headset change consumes the existing
+protocol and does not add that middleware mechanism.

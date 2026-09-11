@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.NetworkInformation;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using System.Text;
 using System.Threading;
 using UnityEngine;
@@ -119,6 +121,7 @@ public class UdpPoseSender : MonoBehaviour
     private struct PoseSnapshot
     {
         public long version;
+        public long capturedTicks;
         public double timestamp;
         public byte flags;
         public PoseState head;
@@ -206,6 +209,25 @@ public class UdpPoseSender : MonoBehaviour
     private volatile bool poseSendThreadStopping;
     private volatile bool poseSenderActive;
     private volatile bool poseSenderSuspended;
+    private const int PosePacketBytes = 162;
+    private readonly byte[] posePacketBuffer = new byte[PosePacketBytes];
+    private MemoryStream posePacketStream;
+    private BinaryWriter posePacketWriter;
+    private volatile IPAddress[] cachedLocalAddresses = new IPAddress[0];
+    private int addressRefreshPending;
+    private int addressRefreshReady;
+    private readonly byte[] discoveryRequestBytes = Encoding.ASCII.GetBytes(DiscoveryRequest);
+    private long lastCaptureTicks;
+    private long lastSuccessfulSendTicks;
+    private long maxCaptureGapTicks;
+    private long maxSendGapTicks;
+    private long maxSendCallTicks;
+    private long maxSampleAgeTicks;
+    private int sendBackpressure;
+    private int sendErrors;
+    private string lastSendError;
+    private double nextDiagnosticsTime;
+
 
     public bool IsTransmissionEnabled => transmissionEnabled;
     public bool HasReceiver => receiverEndPoint != null;
@@ -247,6 +269,12 @@ public class UdpPoseSender : MonoBehaviour
         try
         {
             poseClient = new UdpClient();
+            // Drop a frame under socket backpressure; never wait on the network
+            // while holding the send lock (also used by pause/stop packets).
+            poseClient.Client.Blocking = false;
+            poseClient.Client.SendBufferSize = 16 * 1024;
+            posePacketStream = new MemoryStream(posePacketBuffer, 0, PosePacketBytes, true, true);
+            posePacketWriter = new BinaryWriter(posePacketStream);
             discoveryClient = new UdpClient(0);
             discoveryClient.EnableBroadcast = true;
             discoveryClient.Client.Blocking = false;
@@ -275,6 +303,8 @@ public class UdpPoseSender : MonoBehaviour
     private void Update()
     {
         double now = Time.realtimeSinceStartupAsDouble;
+        ApplyLocalIpRefresh();
+        ReportTransportDiagnostics(now);
 
         SampleControllerInput(
             XRNode.LeftHand,
@@ -359,14 +389,22 @@ public class UdpPoseSender : MonoBehaviour
 
         try
         {
-            byte[] request = Encoding.ASCII.GetBytes(DiscoveryRequest);
+            byte[] request = discoveryRequestBytes;
+            IPEndPoint receiver = receiverEndPoint;
+            if (receiver != null)
+            {
+                // A discovered receiver only needs a directed heartbeat.
+                discoveryClient.Send(request, request.Length,
+                    new IPEndPoint(receiver.Address, discoveryPort));
+                return;
+            }
             // 1. 全局广播 255.255.255.255
             discoveryClient.Send(request, request.Length,
                 new IPEndPoint(IPAddress.Broadcast, discoveryPort));
 
             // 2. 对所有有效 IPv4 网卡发送定向广播。开发机上常同时
             // 存在 Meta、Hyper-V、WLAN 和以太网，只使用默认出口会扫错网段。
-            List<IPAddress> localAddresses = FindAllLocalIpv4Addresses();
+            IPAddress[] localAddresses = cachedLocalAddresses;
             foreach (IPAddress ip in localAddresses)
             {
                 byte[] ipBytes = ip.GetAddressBytes();
@@ -383,7 +421,7 @@ public class UdpPoseSender : MonoBehaviour
             // PICO 热点、Windows 多网卡以及部分路由器会丢弃广播回复。
             // 在尚未找到接收端时，对每个有效 /24 子网分批轮询。所有
             // 网段使用同一批主机号，所以 1-254 只需约八轮即可覆盖。
-            if (receiverEndPoint == null && localAddresses.Count > 0)
+            if (receiverEndPoint == null && localAddresses.Length > 0)
             {
                 int probes = Mathf.Clamp(discoveryUnicastBatchSize, 1, 64);
                 int firstHost = nextDiscoveryHost;
@@ -626,6 +664,10 @@ public class UdpPoseSender : MonoBehaviour
     private void CaptureLatestPoseSnapshot(double timestamp)
     {
         PoseSnapshot snapshot = BuildPoseSnapshot(timestamp, false);
+        snapshot.capturedTicks = Stopwatch.GetTimestamp();
+        if (lastCaptureTicks != 0)
+            RecordMaximum(ref maxCaptureGapTicks, snapshot.capturedTicks - lastCaptureTicks);
+        lastCaptureTicks = snapshot.capturedTicks;
         lock (poseSnapshotLock)
         {
             snapshot.version = ++latestPoseVersion;
@@ -667,7 +709,7 @@ public class UdpPoseSender : MonoBehaviour
         };
     }
 
-    private void SendPoseSnapshot(
+    private bool SendPoseSnapshot(
         PoseSnapshot snapshot,
         IPEndPoint target,
         bool includeInputEdges)
@@ -676,44 +718,98 @@ public class UdpPoseSender : MonoBehaviour
         ControllerInputState packetRightInput = snapshot.rightInput;
         if (!includeInputEdges)
         {
-            packetLeftInput.pressed = 0;
-            packetLeftInput.released = 0;
-            packetRightInput.pressed = 0;
-            packetRightInput.released = 0;
+            packetLeftInput.pressed = packetLeftInput.released = 0;
+            packetRightInput.pressed = packetRightInput.released = 0;
         }
-
         try
         {
             lock (poseSendLock)
             {
-                using (MemoryStream stream = new MemoryStream(192))
-                using (BinaryWriter writer = new BinaryWriter(stream))
+                if (poseClient == null || posePacketWriter == null)
+                    return false;
+                if (snapshot.flags != 0 && (!poseSenderActive || poseSenderSuspended))
+                    return false;
+                posePacketStream.Position = 0;
+                BinaryWriter writer = posePacketWriter;
+                writer.Write((byte)'P'); writer.Write((byte)'I');
+                writer.Write((byte)'C'); writer.Write((byte)'O');
+                writer.Write(ProtocolVersion);
+                writer.Write(sequence);
+                // Preserve Unity's sample timestamp, including repeated samples.
+                // A stalled sampler must remain detectable by the receiver.
+                writer.Write(snapshot.timestamp);
+                writer.Write(snapshot.flags);
+                WritePose(writer, snapshot.head);
+                WritePose(writer, snapshot.left);
+                WritePose(writer, snapshot.right);
+                WriteControllerInput(writer, packetLeftInput);
+                WriteControllerInput(writer, packetRightInput);
+                writer.Flush();
+                long started = Stopwatch.GetTimestamp();
+                if (snapshot.capturedTicks != 0)
+                    RecordMaximum(ref maxSampleAgeTicks, started - snapshot.capturedTicks);
+                try
                 {
-                    writer.Write((byte)'P');
-                    writer.Write((byte)'I');
-                    writer.Write((byte)'C');
-                    writer.Write((byte)'O');
-                    writer.Write(ProtocolVersion);
-                    writer.Write(sequence);
-                    writer.Write(snapshot.timestamp);
-                    writer.Write(snapshot.flags);
-                    WritePose(writer, snapshot.head);
-                    WritePose(writer, snapshot.left);
-                    WritePose(writer, snapshot.right);
-                    WriteControllerInput(writer, packetLeftInput);
-                    WriteControllerInput(writer, packetRightInput);
-
-                    byte[] packet = stream.ToArray();
-                    poseClient.Send(packet, packet.Length, target);
-                    Interlocked.Increment(ref sentPacketsCounter);
-                    unchecked { sequence++; }
+                    poseClient.Send(posePacketBuffer, PosePacketBytes, target);
                 }
+                finally
+                {
+                    RecordMaximum(ref maxSendCallTicks, Stopwatch.GetTimestamp() - started);
+                }
+                long sent = Stopwatch.GetTimestamp();
+                if (lastSuccessfulSendTicks != 0)
+                    RecordMaximum(ref maxSendGapTicks, sent - lastSuccessfulSendTicks);
+                lastSuccessfulSendTicks = sent;
+                Interlocked.Increment(ref sentPacketsCounter);
+                unchecked { sequence++; }
+                return true;
+            }
+        }
+        catch (SocketException exception)
+        {
+            if (exception.SocketErrorCode == SocketError.WouldBlock ||
+                exception.SocketErrorCode == SocketError.NoBufferSpaceAvailable)
+                Interlocked.Increment(ref sendBackpressure);
+            else
+            {
+                Interlocked.Increment(ref sendErrors);
+                Interlocked.Exchange(ref lastSendError, exception.SocketErrorCode.ToString());
             }
         }
         catch (Exception exception)
         {
-            Debug.LogWarning("UDP send failed: " + exception.Message);
+            Interlocked.Increment(ref sendErrors);
+            Interlocked.Exchange(ref lastSendError, exception.Message);
         }
+        return false;
+    }
+
+    private static void RecordMaximum(ref long maximum, long value)
+    {
+        long old;
+        do
+        {
+            old = Interlocked.Read(ref maximum);
+            if (value <= old) return;
+        } while (Interlocked.CompareExchange(ref maximum, value, old) != old);
+    }
+
+    private void ReportTransportDiagnostics(double now)
+    {
+        if (now < nextDiagnosticsTime) return;
+        nextDiagnosticsTime = now + 1.0;
+        double milliseconds = 1000.0 / Stopwatch.Frequency;
+        double captureGap = Interlocked.Exchange(ref maxCaptureGapTicks, 0) * milliseconds;
+        double sendGap = Interlocked.Exchange(ref maxSendGapTicks, 0) * milliseconds;
+        double sendCall = Interlocked.Exchange(ref maxSendCallTicks, 0) * milliseconds;
+        double sampleAge = Interlocked.Exchange(ref maxSampleAgeTicks, 0) * milliseconds;
+        int blocked = Interlocked.Exchange(ref sendBackpressure, 0);
+        int errors = Interlocked.Exchange(ref sendErrors, 0);
+        string error = Interlocked.Exchange(ref lastSendError, null);
+        if (captureGap > 200 || sendGap > 200 || sendCall > 50 || sampleAge > 200 || blocked > 0 || errors > 0)
+            Debug.LogWarning($"[TeleopTiming] sample_time={now:F3} capture_gap_ms={captureGap:F1} " +
+                $"send_gap_ms={sendGap:F1} send_call_ms={sendCall:F1} sample_age_ms={sampleAge:F1} " +
+                $"backpressure={blocked} errors={errors} last_error={error}");
     }
 
     private void StartPoseSendThread()
@@ -766,8 +862,8 @@ public class UdpPoseSender : MonoBehaviour
             if (available)
             {
                 bool includeEdges = snapshot.version != lastSentSnapshotVersion;
-                SendPoseSnapshot(snapshot, target, includeEdges);
-                lastSentSnapshotVersion = snapshot.version;
+                if (SendPoseSnapshot(snapshot, target, includeEdges))
+                    lastSentSnapshotVersion = snapshot.version;
             }
 
             double interval = 1.0 / Math.Max(1.0, rate);
@@ -950,18 +1046,33 @@ public class UdpPoseSender : MonoBehaviour
 
     private void RefreshLocalIp()
     {
-        string previous = localIpAddress;
-        localIpAddress = FindLocalIpv4Address();
-        if (previous != localIpAddress)
-            NetworkStatusChanged?.Invoke();
+        if (Interlocked.CompareExchange(ref addressRefreshPending, 1, 0) != 0)
+            return;
+        // Interface enumeration may invoke platform services. Never run it on
+        // the Unity sampling thread or the pose sender thread.
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                IPAddress[] addresses = FindAllLocalIpv4Addresses().ToArray();
+                if (!poseSendThreadStopping)
+                {
+                    cachedLocalAddresses = addresses;
+                    Interlocked.Exchange(ref addressRefreshReady, 1);
+                }
+            }
+            finally { Interlocked.Exchange(ref addressRefreshPending, 0); }
+        });
     }
 
-    private static string FindLocalIpv4Address()
+    private void ApplyLocalIpRefresh()
     {
-        List<IPAddress> addresses = FindAllLocalIpv4Addresses();
-        if (addresses.Count > 0)
-            return addresses[0].ToString();
-        return "不可用";
+        if (Interlocked.Exchange(ref addressRefreshReady, 0) == 0) return;
+        IPAddress[] addresses = cachedLocalAddresses;
+        string next = addresses.Length > 0 ? addresses[0].ToString() : "不可用";
+        if (next == localIpAddress) return;
+        localIpAddress = next;
+        NetworkStatusChanged?.Invoke();
     }
 
     private static List<IPAddress> FindAllLocalIpv4Addresses()
@@ -990,15 +1101,17 @@ public class UdpPoseSender : MonoBehaviour
 
         try
         {
-            foreach (IPAddress address in Dns.GetHostEntry(Dns.GetHostName()).AddressList)
+            foreach (NetworkInterface network in NetworkInterface.GetAllNetworkInterfaces())
             {
-                if (address.AddressFamily == AddressFamily.InterNetwork &&
-                    !IPAddress.IsLoopback(address) &&
-                    !address.ToString().StartsWith("169.254.", StringComparison.Ordinal) &&
-                    !IsBenchmarkAdapterAddress(address) &&
-                    !addresses.Contains(address))
+                if (network.OperationalStatus != OperationalStatus.Up) continue;
+                foreach (UnicastIPAddressInformation entry in network.GetIPProperties().UnicastAddresses)
                 {
-                    addresses.Add(address);
+                    IPAddress address = entry.Address;
+                    if (address.AddressFamily == AddressFamily.InterNetwork &&
+                        !IPAddress.IsLoopback(address) &&
+                        !address.ToString().StartsWith("169.254.", StringComparison.Ordinal) &&
+                        !IsBenchmarkAdapterAddress(address) && !addresses.Contains(address))
+                        addresses.Add(address);
                 }
             }
         }
@@ -1034,6 +1147,7 @@ public class UdpPoseSender : MonoBehaviour
 
     private void OnApplicationPause(bool paused)
     {
+        Debug.Log($"[TeleopTiming] application_paused={paused} sample_time={Time.realtimeSinceStartupAsDouble:F3}");
         if (paused)
         {
             poseSenderSuspended = true;

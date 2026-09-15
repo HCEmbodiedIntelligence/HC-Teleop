@@ -132,6 +132,11 @@ public class UdpTransmissionButton : MonoBehaviour
         cameraStreamRow = Background(panel, "CameraStreamToolbarRow",
             new Vector2(0f, -205f), new Vector2(846f, 126f));
         RebuildCameraStreamControls(true);
+
+        InterfaceHelpPanel help = panel.GetComponentInChildren<InterfaceHelpPanel>(true);
+        if (help == null)
+            help = PlainObject(panel, "InterfaceHelp").AddComponent<InterfaceHelpPanel>();
+        help.Initialize(GetChineseFont(), GetRoundedCardSprite());
     }
 
     private void BuildHeader(RectTransform panel)
@@ -157,8 +162,9 @@ public class UdpTransmissionButton : MonoBehaviour
         statusText.transform.SetParent(panel, false);
         RectTransform rect = statusText.rectTransform;
         rect.anchorMin = rect.anchorMax = rect.pivot = new Vector2(0.5f, 0.5f);
-        rect.anchoredPosition = new Vector2(145f, 238f);
-        rect.sizeDelta = new Vector2(560f, 38f);
+        // Leave a separate hit area for the help button at the top right.
+        rect.anchoredPosition = new Vector2(75f, 238f);
+        rect.sizeDelta = new Vector2(550f, 38f);
         statusText.raycastTarget = false;
         statusText.enableWordWrapping = false;
         statusText.enableAutoSizing = true;

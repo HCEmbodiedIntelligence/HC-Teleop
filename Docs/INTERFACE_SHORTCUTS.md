@@ -76,3 +76,11 @@ ByteDance.PICO.XR.PXR_Plugin.System.RecenterSuccess
 - APK 签名验证通过，与此前 APK 的签名证书相同，可覆盖升级。
 - 在 Unity 菜单 `HC-Teleop > Build Release APK` 可重复构建，输出到 `Builds/`；构建脚本为 `Assets/Editor/HCTeleopReleaseBuild.cs`。
 - 发布构建没有自动覆盖头显安装；Home 长按与显隐仍需在安装新版后进行物理按键验收。
+
+## v0.1.2 发布构建（2026-09-15）
+
+- 新增右上角菱形问号和五页使用说明，支持指向问号预览、离开立即关闭，以及点击固定、再次点击关闭。
+- 应用版本 `0.1.2`，Android versionCode `3`，包名保持 `com.DefaultCompany.HCTeleop`。
+- Unity 正式构建通过，ARM64、最低 Android API 29；APK 签名验证通过，与 v0.1.1 证书相同，可覆盖升级。
+- SHA-256：`b680d2314347805b56e28b8694d0c5912c0c2c48ee6f070e16ea3751a6a3fd7c`。
+- 帮助界面编译、30 项状态断言和编辑器五页排版及交互检查通过；实际头显射线体验需安装此版本后验证。

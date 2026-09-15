@@ -79,6 +79,26 @@ public sealed class MiddlewareSafetyState
     }
 }
 
+// Local controls follow physical buttons, not UDP's accumulated edge queue.
+// Keep this history across transmission toggles and receiver discovery/reset.
+public sealed class TransmissionButtonState
+{
+    private ushort previousHeld;
+
+    public bool Update(bool enabled, ushort held)
+    {
+        const ushort a = 1 << 0;
+        const ushort b = 1 << 1;
+        bool aPressed = (held & a) != 0 && (previousHeld & a) == 0;
+        previousHeld = held;
+
+        // B wins even if A is pressed simultaneously or a UI button enables UDP.
+        if ((held & b) != 0)
+            return false;
+        return aPressed ? true : enabled;
+    }
+}
+
 public class UdpPoseSender : MonoBehaviour
 {
     private const string DiscoveryRequest = "PICO_DISCOVER_V1";
@@ -196,6 +216,8 @@ public class UdpPoseSender : MonoBehaviour
     private string initializationError;
     private ControllerInputState leftInput;
     private ControllerInputState rightInput;
+    private RightControllerLongPressRecenter interfaceShortcuts;
+    private readonly TransmissionButtonState transmissionButtons = new TransmissionButtonState();
     private ushort previousLeftButtons;
     private ushort previousRightButtons;
     private bool leftInputInitialized;
@@ -317,24 +339,29 @@ public class UdpPoseSender : MonoBehaviour
             ref previousRightButtons,
             ref rightInputInitialized);
 
-        // --- 核心快捷键：按 A 开启遥操作，按 B 关闭遥操作 ---
-        bool aPressedThisFrame = (rightInput.pressed & (ushort)ControllerButton.Primary) != 0;
-        bool bPressedThisFrame = (rightInput.pressed & (ushort)ControllerButton.Secondary) != 0;
-
-        if (aPressedThisFrame)
+        if (interfaceShortcuts == null)
+            interfaceShortcuts = GetComponent<RightControllerLongPressRecenter>();
+        if (interfaceShortcuts != null)
         {
-            if (!transmissionEnabled)
+            interfaceShortcuts.ProcessThumbstickInput(
+                (leftInput.held & (ushort)ControllerButton.PrimaryAxisClick) != 0,
+                (rightInput.held & (ushort)ControllerButton.PrimaryAxisClick) != 0,
+                IsTracked(XRNode.LeftHand) && IsTracked(XRNode.RightHand));
+        }
+
+        // UDP edge bits can remain queued while disconnected. Local A/B controls
+        // must work every frame, independently of sending or clearing that queue.
+        bool desiredTransmission = transmissionButtons.Update(transmissionEnabled, rightInput.held);
+        if (desiredTransmission != transmissionEnabled)
+        {
+            SetTransmissionEnabled(desiredTransmission);
+            if (desiredTransmission)
             {
-                SetTransmissionEnabled(true);
                 TriggerHapticImpulse(XRNode.RightHand, 0.75f, 0.15f);
                 Debug.Log("[Teleop] 右手 A 键按下 -> 开启遥操作传输");
             }
-        }
-        else if (bPressedThisFrame)
-        {
-            if (transmissionEnabled)
+            else
             {
-                SetTransmissionEnabled(false);
                 StartCoroutine(TriggerDoubleHapticImpulse(XRNode.RightHand));
                 Debug.Log("[Teleop] 右手 B 键按下 -> 关闭遥操作传输");
             }
@@ -704,9 +731,22 @@ public class UdpPoseSender : MonoBehaviour
             head = ReadPose(head),
             left = ReadPose(leftController),
             right = ReadPose(rightController),
-            leftInput = forceInvalidFlags ? default(ControllerInputState) : leftInput,
-            rightInput = forceInvalidFlags ? default(ControllerInputState) : rightInput
+            leftInput = forceInvalidFlags ? default(ControllerInputState) : InputForTransmission(leftInput),
+            rightInput = forceInvalidFlags ? default(ControllerInputState) : InputForTransmission(rightInput)
         };
+    }
+
+    private ControllerInputState InputForTransmission(ControllerInputState input)
+    {
+        // Keep raw local inputs intact, but do not turn the UI chord into a
+        // recording mark on existing middleware. Axes and all other buttons survive.
+        if (interfaceShortcuts != null && interfaceShortcuts.ConsumesThumbstickClicks)
+        {
+            input.held = BothThumbsticksGesture.RemoveClick(input.held);
+            input.pressed = BothThumbsticksGesture.RemoveClick(input.pressed);
+            input.released = BothThumbsticksGesture.RemoveClick(input.released);
+        }
+        return input;
     }
 
     private bool SendPoseSnapshot(

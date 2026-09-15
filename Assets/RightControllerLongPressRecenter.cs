@@ -1,11 +1,8 @@
+using System;
+using System.Threading;
+using ByteDance.PICO.XR;
 using UnityEngine;
 using UnityEngine.XR;
-using System;
-using XRCommonUsages = UnityEngine.XR.CommonUsages;
-#if ENABLE_INPUT_SYSTEM
-using UnityEngine.InputSystem;
-#endif
-
 /// <summary>
 /// Single entry point for restoring the application's interface layout.
 /// UI buttons and controller shortcuts both call this service so they can
@@ -40,270 +37,158 @@ public static class InterfaceLayoutResetService
     }
 }
 
+// A gesture must start from both sticks released, including after focus/tracking loss.
+// Holding one stick and tapping the other again is still the same physical chord.
+public sealed class BothThumbsticksGesture
+{
+    private bool armed;
+
+    public void Disarm() => armed = false;
+
+    public bool Sample(bool left, bool right, bool available)
+    {
+        if (!available)
+        {
+            armed = false;
+            return false;
+        }
+        if (!left && !right)
+            armed = true;
+        if (!armed || !left || !right)
+            return false;
+        armed = false;
+        return true;
+    }
+
+    public static ushort RemoveClick(ushort mask)
+    {
+        return (ushort)(mask & ~(1 << 5));
+    }
+}
+
+// Keep the original component/script GUID and public UnityEvent entry points.
+// PICO owns the right Home/circle key; it is not a normal XR menuButton.
 public class RightControllerLongPressRecenter : MonoBehaviour
 {
-    [Header("Long press")]
-    [Min(0.2f)] public float holdSeconds = 1.2f;
-    [Min(0f)] public float releaseGraceSeconds = 0.12f;
-    public bool listenPrimaryButton = false;
-    public bool listenSecondaryButton = false;
-    public bool listenMenuButton = true;
-    public bool listenPrimaryAxisClick = true;
+    [Header("System Home recenter")]
+    [Min(0f)] public float recenterSettleSeconds = 0.15f;
+    [Header("Interface shortcut")]
+    public bool enableBothThumbsticksToggle = true;
+    [Tooltip("Reserve stick clicks for local UI so the middleware does not mark recordings.")]
+    public bool consumeThumbstickClicks = true;
 
-    private UnityEngine.XR.InputDevice rightController;
-    private double holdStartedAt = -1.0;
-    private double lastPressedAt = double.NegativeInfinity;
-    private bool wasPressed;
-    private bool triggeredThisPress;
-    private string activeSource = string.Empty;
-    private UdpPoseSender poseSender;
-#if ENABLE_INPUT_SYSTEM
-    private InputAction rightPrimaryAction;
-    private InputAction rightSecondaryAction;
-    private InputAction rightAxisClickAction;
-#endif
+    private readonly BothThumbsticksGesture gesture = new BothThumbsticksGesture();
+    private InterfaceVisibilityController visibility;
+    private int pendingSystemRecenter;
+    private bool applicationFocused;
+    private bool applicationPaused;
+    private int resetAfterFrame = -1;
+    private double resetAfterTime;
+
+    public bool ConsumesThumbstickClicks => isActiveAndEnabled &&
+        enableBothThumbsticksToggle && consumeThumbstickClicks;
 
     private void Awake()
     {
-#if ENABLE_INPUT_SYSTEM
-        rightPrimaryAction = new InputAction(
-            "ResetWithRightA",
-            InputActionType.Button);
-        rightPrimaryAction.AddBinding(
-            "<XRController>{RightHand}/primaryButton");
-        rightPrimaryAction.AddBinding(
-            "<PXR_Controller>{RightHand}/primaryButton");
-        rightPrimaryAction.AddBinding(
-            "<PICO4UltraController>{RightHand}/primaryButton");
-
-        rightSecondaryAction = new InputAction(
-            "ResetWithRightB",
-            InputActionType.Button);
-        rightSecondaryAction.AddBinding(
-            "<XRController>{RightHand}/secondaryButton");
-        rightSecondaryAction.AddBinding(
-            "<PXR_Controller>{RightHand}/secondaryButton");
-        rightSecondaryAction.AddBinding(
-            "<PICO4UltraController>{RightHand}/secondaryButton");
-
-        rightAxisClickAction = new InputAction(
-            "ResetWithRightStickClick",
-            InputActionType.Button);
-        rightAxisClickAction.AddBinding(
-            "<XRController>{RightHand}/primary2DAxisClick");
-        rightAxisClickAction.AddBinding(
-            "<PXR_Controller>{RightHand}/thumbstickClicked");
-        rightAxisClickAction.AddBinding(
-            "<PICO4UltraController>{RightHand}/thumbstickClicked");
-#endif
-
-        poseSender = GetComponent<UdpPoseSender>();
-        if (poseSender == null)
-            poseSender = FindObjectOfType<UdpPoseSender>(true);
-
+        visibility = GetComponent<InterfaceVisibilityController>();
+        if (visibility == null)
+            visibility = gameObject.AddComponent<InterfaceVisibilityController>();
+        applicationFocused = Application.isFocused;
     }
 
     private void OnEnable()
     {
-#if ENABLE_INPUT_SYSTEM
-        rightPrimaryAction?.Enable();
-        rightSecondaryAction?.Enable();
-        rightAxisClickAction?.Enable();
-#endif
+        gesture.Disarm();
+        PXR_Plugin.System.RecenterSuccess += OnSystemRecenter;
     }
 
-    private void Start()
+    private void OnSystemRecenter()
     {
-#if ENABLE_INPUT_SYSTEM
-        Debug.Log(
-            "Reset input bindings: right A=" +
-            (rightPrimaryAction == null ? 0 : rightPrimaryAction.controls.Count) +
-            ", right B=" +
-            (rightSecondaryAction == null ? 0 : rightSecondaryAction.controls.Count) +
-            ", right stick=" +
-            (rightAxisClickAction == null ? 0 : rightAxisClickAction.controls.Count));
-#endif
+        // The SDK calls this from a native callback; Unity objects are main-thread only.
+        Interlocked.Exchange(ref pendingSystemRecenter, 1);
     }
 
-    private void Update()
+    private void LateUpdate()
     {
-        if (poseSender == null)
-            poseSender = FindObjectOfType<UdpPoseSender>(true);
-
-        if (!rightController.isValid)
-            rightController = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
-
-        bool pressed = IsRecenterButtonPressed();
-        double now = Time.realtimeSinceStartupAsDouble;
-
-        if (pressed)
-            lastPressedAt = now;
-
-        // A short grace interval prevents a single missed XR sample from
-        // cancelling a deliberate long press.
-        bool logicallyPressed = pressed ||
-            (wasPressed && now - lastPressedAt <= releaseGraceSeconds);
-
-        if (!logicallyPressed)
+        if (Interlocked.Exchange(ref pendingSystemRecenter, 0) != 0)
         {
-            holdStartedAt = -1.0;
-            wasPressed = false;
-            triggeredThisPress = false;
-            activeSource = string.Empty;
+            resetAfterFrame = Time.frameCount + 1;
+            resetAfterTime = Time.realtimeSinceStartupAsDouble + recenterSettleSeconds;
+            Debug.Log("[Interface] PICO system recenter received; waiting for updated head pose.");
+        }
+        if (resetAfterFrame < 0 || !applicationFocused || applicationPaused ||
+            Time.frameCount <= resetAfterFrame || Time.realtimeSinceStartupAsDouble < resetAfterTime)
             return;
-        }
 
-        if (!wasPressed)
-        {
-            holdStartedAt = now;
-            wasPressed = true;
-            Debug.Log("Interface reset hold started: " + activeSource);
-        }
-
-        if (!triggeredThisPress &&
-            now - holdStartedAt >= holdSeconds)
-        {
-            triggeredThisPress = true;
-            ResetInterfacePanels();
-        }
+        if (!IsHeadTracked())
+            return;
+        resetAfterFrame = -1;
+        ResetInterfacePanels();
     }
 
-    private bool IsRecenterButtonPressed()
+    private static bool IsHeadTracked()
     {
-        bool primaryPressed = false;
-        bool secondaryPressed = false;
-        bool menuPressed = false;
-        bool axisClickPressed = false;
-#if ENABLE_INPUT_SYSTEM
-        bool inputSystemPrimaryPressed =
-            listenPrimaryButton &&
-            rightPrimaryAction != null &&
-            rightPrimaryAction.IsPressed();
-        bool inputSystemSecondaryPressed =
-            listenSecondaryButton &&
-            rightSecondaryAction != null &&
-            rightSecondaryAction.IsPressed();
-        bool inputSystemAxisClickPressed =
-            listenPrimaryAxisClick &&
-            rightAxisClickAction != null &&
-            rightAxisClickAction.IsPressed();
-#else
-        const bool inputSystemPrimaryPressed = false;
-        const bool inputSystemSecondaryPressed = false;
-        const bool inputSystemAxisClickPressed = false;
-#endif
+        InputDevice head = InputDevices.GetDeviceAtXRNode(XRNode.Head);
+        if (!head.isValid)
+            return false;
+        if (head.TryGetFeatureValue(CommonUsages.isTracked, out bool tracked))
+            return tracked;
+        return head.TryGetFeatureValue(CommonUsages.trackingState, out InputTrackingState state) &&
+            (state & (InputTrackingState.Position | InputTrackingState.Rotation)) != 0;
+    }
 
-        if (rightController.isValid && listenPrimaryButton)
+    // Called immediately after UdpPoseSender samples both hands, even with UDP off.
+    public void ProcessThumbstickInput(bool left, bool right, bool trackingAvailable)
+    {
+        bool available = isActiveAndEnabled && enableBothThumbsticksToggle &&
+            applicationFocused && !applicationPaused && trackingAvailable;
+        if (gesture.Sample(left, right, available))
         {
-            rightController.TryGetFeatureValue(
-                XRCommonUsages.primaryButton,
-                out primaryPressed);
+            visibility.ToggleVisibility();
+            UdpPoseSender.TriggerHapticImpulse(XRNode.LeftHand, 0.3f, 0.06f);
+            UdpPoseSender.TriggerHapticImpulse(XRNode.RightHand, 0.3f, 0.06f);
         }
-
-        if (rightController.isValid && listenSecondaryButton)
-        {
-            rightController.TryGetFeatureValue(
-                XRCommonUsages.secondaryButton,
-                out secondaryPressed);
-        }
-
-        if (rightController.isValid && listenMenuButton)
-        {
-            rightController.TryGetFeatureValue(
-                XRCommonUsages.menuButton,
-                out menuPressed);
-        }
-
-        if (rightController.isValid && listenPrimaryAxisClick)
-        {
-            rightController.TryGetFeatureValue(
-                XRCommonUsages.primary2DAxisClick,
-                out axisClickPressed);
-        }
-
-        // UdpPoseSender is already confirmed to expose the PICO controller
-        // buttons correctly (the same values are visible on the PC dashboard).
-        // Merge those values so reset and UDP can never disagree about B or
-        // the thumbstick click.
-        if (poseSender != null)
-        {
-            if (listenPrimaryButton)
-            {
-                primaryPressed |= poseSender.IsRightButtonHeld(
-                    UdpPoseSender.ControllerButton.Primary);
-            }
-
-            if (listenSecondaryButton)
-            {
-                secondaryPressed |= poseSender.IsRightButtonHeld(
-                    UdpPoseSender.ControllerButton.Secondary);
-            }
-
-            if (listenMenuButton)
-            {
-                menuPressed |= poseSender.IsRightButtonHeld(
-                    UdpPoseSender.ControllerButton.Menu);
-            }
-
-            if (listenPrimaryAxisClick)
-            {
-                axisClickPressed |= poseSender.IsRightButtonHeld(
-                    UdpPoseSender.ControllerButton.PrimaryAxisClick);
-            }
-        }
-
-        primaryPressed |= inputSystemPrimaryPressed;
-        secondaryPressed |= inputSystemSecondaryPressed;
-        axisClickPressed |= inputSystemAxisClickPressed;
-
-        if (axisClickPressed)
-            activeSource = "right thumbstick click";
-        else if (secondaryPressed)
-            activeSource = "right B button";
-        else if (primaryPressed)
-            activeSource = "right A button";
-        else if (menuPressed)
-            activeSource = "right menu button";
-
-        return axisClickPressed || secondaryPressed ||
-               primaryPressed || menuPressed;
     }
 
     public bool ResetNow() => ResetInterfacePanels();
 
     public bool ResetInterfacePanels()
     {
-        int resetCount = InterfaceLayoutResetService.RequestReset(
-            string.IsNullOrEmpty(activeSource)
-                ? "reset controller"
-                : activeSource);
-        return resetCount > 0;
+        // A deliberate recenter also retrieves UI previously hidden with the chord.
+        visibility.SetVisible(true);
+        return InterfaceLayoutResetService.RequestReset("system Home / interface reset") > 0;
     }
 
-    // Keep the old public method name so any existing UnityEvent reference
-    // continues to work, but its behavior is now interface reset.
     public bool RecenterView() => ResetInterfacePanels();
+
+    private void OnApplicationFocus(bool focused)
+    {
+        applicationFocused = focused;
+        gesture.Disarm();
+        // Focus alone is not a recenter event (short Home also changes focus).
+        if (resetAfterFrame >= 0)
+        {
+            resetAfterFrame = Time.frameCount + 1;
+            resetAfterTime = Time.realtimeSinceStartupAsDouble + recenterSettleSeconds;
+        }
+    }
+
+    private void OnApplicationPause(bool paused)
+    {
+        applicationPaused = paused;
+        gesture.Disarm();
+        if (!paused && resetAfterFrame >= 0)
+        {
+            resetAfterFrame = Time.frameCount + 1;
+            resetAfterTime = Time.realtimeSinceStartupAsDouble + recenterSettleSeconds;
+        }
+    }
 
     private void OnDisable()
     {
-#if ENABLE_INPUT_SYSTEM
-        rightPrimaryAction?.Disable();
-        rightSecondaryAction?.Disable();
-        rightAxisClickAction?.Disable();
-#endif
-        holdStartedAt = -1.0;
-        lastPressedAt = double.NegativeInfinity;
-        wasPressed = false;
-        triggeredThisPress = false;
-        activeSource = string.Empty;
-    }
-
-    private void OnDestroy()
-    {
-#if ENABLE_INPUT_SYSTEM
-        rightPrimaryAction?.Dispose();
-        rightSecondaryAction?.Dispose();
-        rightAxisClickAction?.Dispose();
-#endif
+        PXR_Plugin.System.RecenterSuccess -= OnSystemRecenter;
+        Interlocked.Exchange(ref pendingSystemRecenter, 0);
+        resetAfterFrame = -1;
+        gesture.Disarm();
     }
 }

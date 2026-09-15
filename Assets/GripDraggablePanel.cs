@@ -102,16 +102,6 @@ public class GripDraggablePanel : MonoBehaviour
     {
         FindHeadIfNeeded();
 
-        // 开启遥操作后彻底禁止拖动画面与面板
-        if (IsTeleopActive())
-        {
-            if (draggingController != null || activePanel == this)
-            {
-                EndDrag();
-            }
-            return;
-        }
-
         bool leftGripPressed = IsGripPressed(XRNode.LeftHand);
         bool rightGripPressed = IsGripPressed(XRNode.RightHand);
         bool leftGripPressedThisFrame =
@@ -121,6 +111,15 @@ public class GripDraggablePanel : MonoBehaviour
 
         wasLeftGripPressed = leftGripPressed;
         wasRightGripPressed = rightGripPressed;
+
+        // Keep grip history current while hidden or teleoperating, so a held
+        // grip cannot start an invisible drag or a new drag when UI returns.
+        if (!InterfaceVisibilityController.IsInterfaceVisible || IsTeleopActive())
+        {
+            if (draggingController != null || activePanel == this)
+                EndDrag();
+            return;
+        }
 
         if (draggingController != null)
         {
@@ -311,6 +310,9 @@ public class GripDraggablePanel : MonoBehaviour
 
     private bool IsPanelInteractionEnabled()
     {
+        if (!InterfaceVisibilityController.IsInterfaceVisible)
+            return false;
+
         CanvasGroup canvasGroup = GetComponent<CanvasGroup>();
         return canvasGroup == null ||
                (canvasGroup.alpha > 0.001f && canvasGroup.blocksRaycasts);

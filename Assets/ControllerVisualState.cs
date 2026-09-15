@@ -133,16 +133,17 @@ public sealed class ControllerVisualState : MonoBehaviour
 
         bool leftTracked = applicationActive && IsTracked(XRNode.LeftHand);
         bool rightTracked = applicationActive && IsTracked(XRNode.RightHand);
+        bool interfaceVisible = InterfaceVisibilityController.IsInterfaceVisible;
 
         SetObjectsActive(leftModelRoots, leftTracked);
         SetObjectsActive(rightModelRoots, rightTracked);
-        SetRayVisible(leftRayVisual, leftTracked);
-        SetRayVisible(rightRayVisual, rightTracked);
+        SetRayVisible(leftRayVisual, leftTracked && interfaceVisible);
+        SetRayVisible(rightRayVisual, rightTracked && interfaceVisible);
 
         if (leftMarker != null)
-            leftMarker.SetActive(leftTracked && markersRequested);
+            leftMarker.SetActive(leftTracked && markersRequested && interfaceVisible);
         if (rightMarker != null)
-            rightMarker.SetActive(rightTracked && markersRequested);
+            rightMarker.SetActive(rightTracked && markersRequested && interfaceVisible);
     }
 
     private void HideAllVisuals()

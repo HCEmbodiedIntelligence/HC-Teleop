@@ -4,7 +4,10 @@
 EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
-  m_Scenes: []
+  m_Scenes:
+  - enabled: 1
+    path: Assets/Scenes/SampleScene.unity
+    guid: 9fc0d4010bbf28b4594072e72b8655ab
   m_configObjects:
     ByteDance.PICO.XR.Settings: {fileID: 11400000, guid: 7412d232f24efa54994a0538a0336176, type: 2}
     com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 4312b0f9f6b9e4446bb6d4985e0255bb, type: 2}

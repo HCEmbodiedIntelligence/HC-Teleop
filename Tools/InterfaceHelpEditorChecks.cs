@@ -44,11 +44,20 @@ public static class InterfaceHelpEditorChecks
             typeof(UdpTransmissionButton).GetField("udpButton", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(toolbar, udpObj.GetComponent<Button>());
             typeof(UdpTransmissionButton).GetMethod("BuildInterface", BindingFlags.NonPublic | BindingFlags.Instance).Invoke(toolbar, null);
             InterfaceHelpPanel help = panel.GetComponentInChildren<InterfaceHelpPanel>(true);
+            UdpPoseSender sender = Child(root.transform, "SafetyState").AddComponent<UdpPoseSender>();
+            typeof(InterfaceHelpPanel).GetField("poseSender", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(help, sender);
+            MiddlewareSafetyState safety = (MiddlewareSafetyState)typeof(UdpPoseSender)
+                .GetField("safetyState", BindingFlags.NonPublic | BindingFlags.Instance).GetValue(sender);
             Transform popup = help.transform.Find("HelpPopup");
             Transform trigger = help.transform.Find("HelpButton");
             Require(!popup.gameObject.activeSelf, "help initially closed");
             EventSystem events = Child(root.transform, "Events", typeof(EventSystem)).GetComponent<EventSystem>();
             PointerEventData pointer = new PointerEventData(events) { pointerId = 101 };
+            ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerEnterHandler);
+            trigger.GetComponent<Button>().onClick.Invoke();
+            Require(!popup.gameObject.activeSelf, "non-emergency hover and click cannot open help");
+            safety.Apply(new MiddlewareEventJson { kind = "safety_stop", timestamp = 1,
+                payload = new MiddlewareEventPayload { reason = "no VR pose data for 201 ms" } });
             ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerEnterHandler);
             Require(popup.gameObject.activeSelf, "pointer enter opens help");
             popup.Find("Page1").GetComponent<Button>().onClick.Invoke();
@@ -71,6 +80,16 @@ public static class InterfaceHelpEditorChecks
             ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerExitHandler);
             ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerEnterHandler);
             Require(popup.gameObject.activeSelf, "re-enter opens help again");
+            ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerClickHandler);
+
+            safety.Apply(new MiddlewareEventJson { kind = "safety_resume", timestamp = 2,
+                payload = new MiddlewareEventPayload() });
+            typeof(InterfaceHelpPanel).GetMethod("LateUpdate", BindingFlags.NonPublic | BindingFlags.Instance).Invoke(help, null);
+            Require(!popup.gameObject.activeSelf, "resume closes pinned popup without another pointer event");
+            Require(!trigger.GetComponent<Button>().interactable, "resume disables question button");
+            safety.Apply(new MiddlewareEventJson { kind = "safety_stop", timestamp = 3,
+                payload = new MiddlewareEventPayload { reason = "head tracking invalid" } });
+            ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerEnterHandler);
             ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerClickHandler);
 
             RectTransform triggerRect = (RectTransform)trigger;

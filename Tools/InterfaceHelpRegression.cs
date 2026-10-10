@@ -33,6 +33,7 @@ public static class InterfaceHelpRegression
             CheckPinAndUnpin();
             CheckExplicitCloseSuppression();
             CheckResetForFocusAndGlobalHide();
+            CheckEmergencyAndGripAccess();
             Console.WriteLine("PASS: " + assertions + " help-visibility assertions");
             return 0;
         }
@@ -151,7 +152,48 @@ public static class InterfaceHelpRegression
         Expect(state, false, false, "repeated hidden-frame resets are harmless");
     }
 
-    private static object NewState() { return Activator.CreateInstance(visibilityType); }
+    private static void CheckEmergencyAndGripAccess()
+    {
+        object state = Activator.CreateInstance(visibilityType);
+        Enter(state, 70);
+        Call(state, "TogglePin");
+        Expect(state, false, false, "unknown initial safety state blocks help");
+        foreach (bool stopped in new[] { false, true })
+        foreach (bool grip in new[] { false, true })
+        foreach (bool shown in new[] { false, true })
+        {
+            Call(state, "Reset");
+            Call(state, "SetAccess", stopped, grip, shown);
+            Enter(state, 70);
+            bool allowed = stopped && !grip && shown;
+            Expect(state, allowed, false, "hover respects emergency, grip and visibility gates");
+            Call(state, "TogglePin");
+            Expect(state, allowed, allowed, "click respects emergency, grip and visibility gates");
+        }
+        Call(state, "SetAccess", true, false, true);
+        Enter(state, 70);
+        Call(state, "TogglePin");
+        Call(state, "SetAccess", true, true, true);
+        Expect(state, false, false, "grip press immediately closes pinned help");
+        Call(state, "TogglePin");
+        Enter(state, 71);
+        Call(state, "SetAccess", true, false, true);
+        Expect(state, false, false, "grip release cannot restore stale hover or pin");
+        Enter(state, 71);
+        Expect(state, true, false, "fresh hover after grip release opens help");
+        Call(state, "TogglePin");
+        Call(state, "SetAccess", false, false, true);
+        Expect(state, false, false, "confirmed safety resume closes pinned help");
+        Call(state, "SetAccess", true, false, true);
+        Expect(state, false, false, "another stop does not resurrect previous help");
+    }
+
+    private static object NewState()
+    {
+        object state = Activator.CreateInstance(visibilityType);
+        Call(state, "SetAccess", true, false, true);
+        return state;
+    }
     private static void Enter(object state, int pointerId) { Call(state, "Enter", pointerId); }
     private static void Exit(object state, int pointerId) { Call(state, "Exit", pointerId); }
     private static void Call(object state, string method, params object[] args)

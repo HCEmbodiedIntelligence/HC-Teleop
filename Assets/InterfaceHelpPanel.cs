@@ -3,6 +3,7 @@ using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
+using UnityEngine.XR;
 
 // Only the question button owns hover state. Clicking switches to persistent
 // help; clicking it again closes help even while the pointer remains on it.
@@ -10,11 +11,19 @@ public sealed class InterfaceHelpVisibility
 {
     private readonly HashSet<int> buttonPointers = new HashSet<int>();
     private bool dismissed;
-    public bool Visible => Pinned || (!dismissed && buttonPointers.Count > 0);
+    public bool Allowed { get; private set; }
+    public bool Visible => Allowed && (Pinned || (!dismissed && buttonPointers.Count > 0));
     public bool Pinned { get; private set; }
+
+    public void SetAccess(bool emergencyStopped, bool gripHeld, bool interfaceVisible)
+    {
+        Allowed = emergencyStopped && !gripHeld && interfaceVisible;
+        if (!Allowed) Reset();
+    }
 
     public void Enter(int pointerId)
     {
+        if (!Allowed) return;
         buttonPointers.Add(pointerId);
     }
 
@@ -26,6 +35,7 @@ public sealed class InterfaceHelpVisibility
 
     public void TogglePin()
     {
+        if (!Allowed) return;
         Pinned = !Pinned;
         dismissed = !Pinned && buttonPointers.Count > 0;
     }
@@ -58,7 +68,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
             new Entry("左手 X / Y · 录制", "X 开始录制，Y 停止录制。\n需连接中间件并开启 UDP。"),
             new Entry("右侧圆圈键 · 界面复位", "长按系统圆圈键，系统复位完成\n后界面回到眼前；短按打开系统。"),
             new Entry("双摇杆按下 · 显示 / 隐藏", "同时按下左右摇杆切换所有界面。\n两边都松开后，再按可切换回来。"),
-            new Entry("射线 + 扳机 · 点击", "将手柄射线指向按钮，扣动扳机。\n指向菱形问号即可悬停阅读说明。")
+            new Entry("射线 + 扳机 · 点击", "将手柄射线指向按钮，扣动扳机。\n急停且松开双手握把后可查看说明。")
         },
         new[]
         {
@@ -94,7 +104,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
             new Entry("左右扳机 · 夹爪", "控制对应夹爪开合。\n扳机同时也用于界面点击。"),
             new Entry("左侧握把 · 底盘 / 腰部", "配合摇杆 / 头部动作控制底盘、\n腰部；仅适用于支持该功能的机器人。"),
             new Entry("摇杆向外拨 · 机器人回零", "左杆向左、右杆向右：机器人回零。\n向下按两摇杆才是界面显隐。"),
-            new Entry("查看说明期间", "说明面板不会暂停遥操作。\n需要停止发送时，先按 B 关闭 UDP。")
+            new Entry("查看说明期间", "仅急停且双手握把松开时可查看。\n恢复或按下任一握把会收起说明。")
         }
     };
 
@@ -106,6 +116,8 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
     private RectTransform popup;
     private TMP_Text footer;
     private Image diamond;
+    private Button helpButton;
+    private UdpPoseSender poseSender;
     private TMP_FontAsset font;
     private Sprite cardSprite;
     private int currentPage;
@@ -131,9 +143,14 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
         Image inset = Box(diamond.transform, "Inset", Vector2.zero, new Vector2(29f, 29f), Card, false).GetComponent<Image>();
         inset.raycastTarget = false;
         Text(trigger, "QuestionMark", "?", Vector2.zero, new Vector2(40f, 42f), 30f, true, TextAlignmentOptions.Center);
-        Button helpButton = trigger.gameObject.AddComponent<Button>();
+        helpButton = trigger.gameObject.AddComponent<Button>();
         helpButton.targetGraphic = diamond;
-        helpButton.onClick.AddListener(() => { visibility.TogglePin(); ApplyVisibility(); });
+        helpButton.onClick.AddListener(() =>
+        {
+            RefreshAccess();
+            visibility.TogglePin();
+            ApplyVisibility();
+        });
         AddHover(trigger);
 
         // Same canvas as the toolbar: global UI hiding also hides help. Its
@@ -187,6 +204,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
         EventTrigger.Entry enter = new EventTrigger.Entry { eventID = EventTriggerType.PointerEnter };
         enter.callback.AddListener(data =>
         {
+            RefreshAccess();
             visibility.Enter(((PointerEventData)data).pointerId);
             ApplyVisibility();
         });
@@ -200,10 +218,28 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
         trigger.triggers.Add(leave);
     }
 
-    private void Update()
+    // Run after the sender's Update has processed safety resume events.
+    private void LateUpdate()
     {
-        if (!InterfaceVisibilityController.IsInterfaceVisible) visibility.Reset();
         ApplyVisibility();
+    }
+
+    private void RefreshAccess()
+    {
+        if (poseSender == null)
+            poseSender = FindObjectOfType<UdpPoseSender>(true);
+        visibility.SetAccess(poseSender != null && poseSender.IsEmergencyStopped,
+            IsGripHeld(XRNode.LeftHand) || IsGripHeld(XRNode.RightHand),
+            InterfaceVisibilityController.IsInterfaceVisible);
+        if (helpButton != null) helpButton.interactable = visibility.Allowed;
+    }
+
+    private static bool IsGripHeld(XRNode node)
+    {
+        InputDevice device = InputDevices.GetDeviceAtXRNode(node);
+        if (!device.isValid) return false;
+        return (device.TryGetFeatureValue(CommonUsages.gripButton, out bool pressed) && pressed) ||
+               (device.TryGetFeatureValue(CommonUsages.grip, out float value) && value >= 0.55f);
     }
 
     private void OnDisable()
@@ -221,6 +257,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
 
     private void ApplyVisibility()
     {
+        RefreshAccess();
         if (popup == null) return;
         if (popup.gameObject.activeSelf != visibility.Visible) popup.gameObject.SetActive(visibility.Visible);
         footer.text = visibility.Pinned

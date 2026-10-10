@@ -43,6 +43,18 @@ public class CameraFrameViewer : MonoBehaviour
     [Min(160f)] public float minimumVideoPanelHeight = 220f;
     [Min(300f)] public float maximumVideoPanelHeight = 1080f;
 
+    public enum StereoDisplayMode
+    {
+        Auto = 0,
+        ForceMono = 1,
+        ForceStereo = 2
+    }
+
+    [Header("立体显示（SBS）")]
+    public StereoDisplayMode stereoDisplayMode = StereoDisplayMode.Auto;
+    private bool isStereoActive;
+    private Material stereoUiMaterial;
+
     private RTCPeerConnection peerConnection;
     private VideoStreamTrack receivedVideoTrack;
     private Coroutine webRtcUpdateCoroutine;
@@ -76,6 +88,9 @@ public class CameraFrameViewer : MonoBehaviour
     // after middleware reports a non-zero capture FPS, or when the user opens it.
     private bool isWindowVisible;
     private bool statsWarningLogged;
+    private float lastVideoStatsRealtime = -100f;
+    private bool videoFpsKnown;
+    private bool hasObservedDecodedProgress;
     private static Coroutine sharedWebRtcUpdateCoroutine;
     private static CameraFrameViewer sharedWebRtcUpdateOwner;
     private float defaultVideoPanelHeight;
@@ -89,7 +104,22 @@ public class CameraFrameViewer : MonoBehaviour
     private GameObject resizeHandlesRoot;
     private GameObject statusBarBgObj;
 
-    public float DisplayedVideoFps => displayedVideoFps;
+    private bool HasVideoImage => targetImage != null && targetImage.texture != null;
+    private bool HasFreshVideoStats => previousStatsRealtime > 0f &&
+        Time.realtimeSinceStartup - lastVideoStatsRealtime < 3f;
+    private bool HasKnownVideoFps => videoFpsKnown && HasFreshVideoStats && !IsDecodedVideoStalled &&
+        Time.realtimeSinceStartup - lastFrameRealtime < 3f;
+    // Frozen Android counters cannot prove that rendering stopped. Only call
+    // it stalled when decoding previously advanced and fresh RTP keeps arriving.
+    private bool IsDecodedVideoStalled => HasFreshVideoStats && hasObservedDecodedProgress &&
+        Time.realtimeSinceStartup - lastFrameRealtime < 3f &&
+        Time.realtimeSinceStartup - lastDecodedFrameRealtime >= 6f;
+    private string VideoFpsText => HasKnownVideoFps
+        ? displayedVideoFps.ToString("F1") + " FPS" : "FPS 未知";
+    private string VideoActivityText => IsDecodedVideoStalled ? "画面停滞" :
+        HasKnownVideoFps && displayedVideoFps > 0f ? "LIVE" :
+        receivedVideoTrack != null ? "已连接 · 统计未更新" : "连接断开 · 保留上一帧";
+    public float DisplayedVideoFps => HasKnownVideoFps ? displayedVideoFps : 0f;
     public string StreamId => streamId;
     public string StreamDisplayName => streamDisplayName;
     public bool IsVideoConnected =>
@@ -105,11 +135,98 @@ public class CameraFrameViewer : MonoBehaviour
     {
         get
         {
-            if (!IsVideoConnected)
-                return streamDisplayName + ": " + connectionState;
+            if (!HasVideoImage)
+                return streamDisplayName + ": " + connectionState +
+                    (frameWidth > 0 && frameHeight > 0 ? "  " + frameWidth + "×" + frameHeight : string.Empty) +
+                    "  FPS 未知";
 
-            return streamDisplayName + ": WebRTC H.264  " + frameWidth + "×" + frameHeight + "\n" +
-                   "视频 FPS: " + displayedVideoFps.ToString("F1");
+            string modeBadge = isStereoActive ? " [3D双目]" : " [2D]";
+            return streamDisplayName + modeBadge + ": WebRTC H.264  " + frameWidth + "×" + frameHeight + "\n" +
+                   VideoActivityText + "  " + VideoFpsText;
+        }
+    }
+
+    public bool IsStereoActive => isStereoActive;
+
+    public void ToggleStereoMode()
+    {
+        if (stereoDisplayMode == StereoDisplayMode.Auto)
+            stereoDisplayMode = isStereoActive ? StereoDisplayMode.ForceMono : StereoDisplayMode.ForceStereo;
+        else if (stereoDisplayMode == StereoDisplayMode.ForceMono)
+            stereoDisplayMode = StereoDisplayMode.ForceStereo;
+        else
+            stereoDisplayMode = StereoDisplayMode.ForceMono;
+
+        UpdateStereoState();
+        UpdateVideoPanelLayout();
+        RefreshStatusText();
+    }
+
+    private bool DetermineStereoState()
+    {
+        if (stereoDisplayMode == StereoDisplayMode.ForceMono)
+            return false;
+        if (stereoDisplayMode == StereoDisplayMode.ForceStereo)
+            return true;
+
+        // 1. 根据流 ID 或名称特征识别
+        string idLower = (streamId ?? string.Empty).ToLowerInvariant();
+        string nameLower = (streamDisplayName ?? string.Empty).ToLowerInvariant();
+        if (idLower.Contains("stereo") || idLower.Contains("sbs") ||
+            nameLower.Contains("stereo") || nameLower.Contains("双目"))
+        {
+            return true;
+        }
+
+        // 2. 根据左右拼接宽屏比例自动识别 (SBS 宽高比通常为 2.2 ~ 3.6，如 1280x480=2.67, 2560x720=3.56)
+        if (frameWidth > 0 && frameHeight > 0)
+        {
+            float rawAspect = (float)frameWidth / frameHeight;
+            if (rawAspect >= 2.15f)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void UpdateStereoState()
+    {
+        isStereoActive = DetermineStereoState();
+        EnsureStereoMaterial();
+        if (stereoUiMaterial != null)
+        {
+            stereoUiMaterial.SetFloat("_StereoMode", isStereoActive ? 1.0f : 0.0f);
+        }
+    }
+
+    private void EnsureStereoMaterial()
+    {
+        if (stereoUiMaterial == null)
+        {
+            Material baseMat = Resources.Load<Material>("UI-StereoSideBySide");
+            if (baseMat != null)
+            {
+                stereoUiMaterial = new Material(baseMat)
+                {
+                    name = "UI_Stereo_Instance_" + streamId
+                };
+            }
+            else
+            {
+                Shader shader = Shader.Find("UI/StereoSideBySide");
+                if (shader != null)
+                {
+                    stereoUiMaterial = new Material(shader)
+                    {
+                        name = "UI_Stereo_Instance_" + streamId
+                    };
+                }
+            }
+        }
+
+        if (targetImage != null && stereoUiMaterial != null && targetImage.material != stereoUiMaterial)
+        {
+            targetImage.material = stereoUiMaterial;
         }
     }
 
@@ -134,6 +251,19 @@ public class CameraFrameViewer : MonoBehaviour
                 videoStatusText = videoPanel.GetComponentInChildren<TMP_Text>(true);
             if (videoStatusText == null && targetImage != null)
                 videoStatusText = targetImage.GetComponentInChildren<TMP_Text>(true);
+        }
+
+        if (videoStatusText != null)
+        {
+            videoStatusText.raycastTarget = true;
+            Button btn = videoStatusText.GetComponent<Button>();
+            if (btn == null)
+            {
+                btn = videoStatusText.gameObject.AddComponent<Button>();
+                btn.transition = Selectable.Transition.ColorTint;
+            }
+            btn.onClick.RemoveListener(ToggleStereoMode);
+            btn.onClick.AddListener(ToggleStereoMode);
         }
 
         SetWindowVisible(false);
@@ -286,6 +416,7 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void OnEnable()
     {
+        Camera.onPreRender += OnCameraPreRender;
         EnsureRuntimeCoroutines();
     }
 
@@ -303,6 +434,7 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void OnDisable()
     {
+        Camera.onPreRender -= OnCameraPreRender;
         if (connectionCoroutine != null)
             StopCoroutine(connectionCoroutine);
         if (statsCoroutine != null)
@@ -316,6 +448,13 @@ public class CameraFrameViewer : MonoBehaviour
         ClosePeerConnection(true);
         StopSharedWebRtcUpdateIfOwner();
         webRtcUpdateCoroutine = null;
+    }
+
+    private static void OnCameraPreRender(Camera cam)
+    {
+        if (cam == null) return;
+        float eye = (cam.stereoActiveEye == Camera.MonoOrStereoscopicEye.Right) ? 1.0f : 0.0f;
+        Shader.SetGlobalFloat("_GlobalStereoEyeIndex", eye);
     }
 
     private void StartSharedWebRtcUpdate()
@@ -647,6 +786,7 @@ public class CameraFrameViewer : MonoBehaviour
             if (statsConnection == null || receivedVideoTrack == null)
             {
                 displayedVideoFps = 0f;
+                videoFpsKnown = false;
                 continue;
             }
 
@@ -701,6 +841,10 @@ public class CameraFrameViewer : MonoBehaviour
                 uint currentFrames = inbound.framesDecoded > 0 ? inbound.framesDecoded : inbound.framesReceived;
                 bool frameAdvanced = currentFrames > previousDecodedFrames;
                 bool transportAdvanced = currentBytes > previousBytesReceived || currentPackets > previousPacketsReceived;
+                lastVideoStatsRealtime = now;
+                // A cached FPS value with frozen counters is not a current measurement.
+                videoFpsKnown = previousStatsRealtime > 0f &&
+                    (frameAdvanced || (transportAdvanced && inbound.framesPerSecond > 0));
 
                 if (previousStatsRealtime > 0f && transportAdvanced)
                     hasObservedTransportProgress = true;
@@ -711,7 +855,10 @@ public class CameraFrameViewer : MonoBehaviour
                     consecutiveFailures = 0;
                 }
                 if (frameAdvanced)
+                {
                     lastDecodedFrameRealtime = now;
+                    hasObservedDecodedProgress = true;
+                }
 
                 if (previousStatsRealtime > 0f)
                 {
@@ -776,19 +923,25 @@ public class CameraFrameViewer : MonoBehaviour
             return;
 
         statsWarningLogged = true;
+        videoFpsKnown = false;
         Debug.LogWarning("WebRTC 视频统计暂不可用: " + message);
     }
 
     private void UpdateVideoPanelLayout()
     {
+        UpdateStereoState();
+
+        float effectiveFrameWidth = isStereoActive ? (frameWidth * 0.5f) : frameWidth;
+        float effectiveFrameHeight = frameHeight;
+
         float videoHeight = videoPanelHeight;
         float videoWidth = videoPanelHeight * (16f / 9f);
 
-        if (frameWidth > 0 && frameHeight > 0)
+        if (effectiveFrameWidth > 0 && effectiveFrameHeight > 0)
         {
-            float aspect = Mathf.Clamp((float)frameWidth / frameHeight, 0.5f, 3f);
-            videoHeight = useNativeResolution ? frameHeight : videoPanelHeight;
-            videoWidth = useNativeResolution ? frameWidth : videoHeight * aspect;
+            float aspect = Mathf.Clamp(effectiveFrameWidth / effectiveFrameHeight, 0.5f, 3f);
+            videoHeight = useNativeResolution ? effectiveFrameHeight : videoPanelHeight;
+            videoWidth = useNativeResolution ? effectiveFrameWidth : videoHeight * aspect;
         }
 
         if (aspectRatioFitter != null)
@@ -1051,6 +1204,9 @@ public class CameraFrameViewer : MonoBehaviour
         weakNetworkActive = false;
         hasObservedTransportProgress = false;
         statsWarningLogged = false;
+        videoFpsKnown = false;
+        hasObservedDecodedProgress = false;
+        lastVideoStatsRealtime = -100f;
 
         if (peerConnection != null)
         {
@@ -1071,22 +1227,31 @@ public class CameraFrameViewer : MonoBehaviour
         if (videoStatusText == null)
             return;
 
-        if (IsVideoConnected)
+        if (HasVideoImage)
         {
-            string liveState = weakNetworkActive
-                ? "<color=#FFB826>● 弱网</color>"
-                : "<color=#00E676>● LIVE</color>";
+            bool live = HasKnownVideoFps && displayedVideoFps > 0f && !IsDecodedVideoStalled;
+            string activity = VideoActivityText;
+            if (live && weakNetworkActive)
+                activity = "LIVE · 弱网";
+            string color = live && !weakNetworkActive ? "#00E676" : "#FFB826";
+            string liveState = "<color=" + color + ">● " + activity + "</color>";
+            string modeBadge = isStereoActive
+                ? "  <color=#00E5FF><b>[3D双目]</b></color>"
+                : "  <color=#8E8E93>[2D单目]</color>";
             string quality = packetLossPercent >= 0.1f
                 ? "  <color=#FFB826>丢包 " + packetLossPercent.ToString("F1") + "%</color>"
                 : string.Empty;
             videoStatusText.text =
-                "<b>" + streamDisplayName + "</b>  " + liveState + "  " + frameWidth + "×" + frameHeight +
-                "  <color=#00C7FF>" + displayedVideoFps.ToString("F1") + " FPS</color>" + quality +
+                "<b>" + streamDisplayName + "</b>" + modeBadge + "  " + liveState + "  " + frameWidth + "×" + frameHeight +
+                "  <color=#00C7FF>" + VideoFpsText + "</color>" + quality +
                 "  (PC: " + currentServerIp + ")";
             return;
         }
 
-        videoStatusText.text = "<b>" + streamDisplayName + "</b>  <color=#FFB826>● " + connectionState + "</color>";
+        string knownResolution = frameWidth > 0 && frameHeight > 0
+            ? "  " + frameWidth + "×" + frameHeight : string.Empty;
+        videoStatusText.text = "<b>" + streamDisplayName + "</b>  <color=#FFB826>● " + connectionState + "</color>" +
+            knownResolution + "  <color=#00C7FF>FPS 未知</color>";
         if (!string.IsNullOrEmpty(lastError))
             videoStatusText.text += "  <size=80%><color=#FF4D4D>(" + lastError + ")</color></size>";
     }

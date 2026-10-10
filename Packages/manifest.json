@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "com.bytedance.pico.xr": "file:C:/Users/maple/Downloads/PICO-Unity-SDK-0.13.1-Preview/XR",
+    "com.bytedance.pico.xr": "file:com.bytedance.pico.xr",
     "com.unity.collab-proxy": "2.12.4",
     "com.unity.feature.development": "1.0.1",
     "com.unity.textmeshpro": "3.0.7",

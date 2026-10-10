@@ -33,7 +33,10 @@ public class GripDraggablePanel : MonoBehaviour
     {
         if (cachedPoseSender == null)
             cachedPoseSender = FindObjectOfType<UdpPoseSender>(true);
-        return cachedPoseSender != null && cachedPoseSender.IsTransmissionEnabled;
+        // UDP stays enabled during a safety stop so A can request recovery.
+        // That transport state must not keep local panel interaction locked.
+        return cachedPoseSender != null && cachedPoseSender.IsTransmissionEnabled &&
+               !cachedPoseSender.IsEmergencyStopped;
     }
 
     public static void EndAllDrags()

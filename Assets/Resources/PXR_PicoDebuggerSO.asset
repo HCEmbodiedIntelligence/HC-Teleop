@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 2e0a90bb5cd1f4084a2c39abb6b1dee2, type: 3}
   m_Name: PXR_PicoDebuggerSO
   m_EditorClassIdentifier: 
-  version: 0.3.1
+  version: 0.4.2
   isOpen: 0
   startPosition: 0
   inputActionAsset: {fileID: 0}
@@ -21,3 +21,4 @@ MonoBehaviour:
   localPositionStep: 1
   worldRotationStep: 1
   localRotationStep: 1
+  worldScaleStep: 1

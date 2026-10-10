@@ -1,9 +1,9 @@
 {
   "dependencies": {
     "com.bytedance.pico.xr": {
-      "version": "file:C:/Users/maple/Downloads/PICO-Unity-SDK-0.13.1-Preview/XR",
+      "version": "file:com.bytedance.pico.xr",
       "depth": 0,
-      "source": "local",
+      "source": "embedded",
       "dependencies": {
         "com.unity.xr.management": "4.0.0",
         "com.unity.xr.interaction.toolkit": "2.0.0",

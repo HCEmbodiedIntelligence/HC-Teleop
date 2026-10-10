@@ -56,3 +56,7 @@ Desktop.ini
 
 # Unity Version Control (Plastic SCM)
 .plastic/
+
+# Embedded large SDK packages
+Packages/com.bytedance.pico.xr/
+Packages/PICO-Unity-SDK/

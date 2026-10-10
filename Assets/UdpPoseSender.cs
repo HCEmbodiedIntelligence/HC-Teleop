@@ -611,6 +611,8 @@ public class UdpPoseSender : MonoBehaviour
                 return;
             // Keep sending input so A can reach the middleware's resume handler.
             // A local transmission toggle or recovered tracking must not clear this state.
+            if (!IsEmergencyStopped && transmissionEnabled)
+                GripDraggablePanel.EndAllDrags();
             if (!IsEmergencyStopped && ReplayRequiresReset)
             {
                 ReplayState = "idle";

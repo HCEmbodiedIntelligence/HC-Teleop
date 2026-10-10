@@ -82,6 +82,11 @@ continues while enabled so the middleware can receive the A-button resume reques
 The display waits for the middleware confirmation; pressing A does not locally
 acknowledge the stop. The existing replay-reset acknowledgement is preserved.
 
+While the safety stop is latched, visible interface cards can be dragged and
+camera cards can be resized even when UDP transmission remains enabled. Release
+and press grip again to start an interaction. A confirmed resume immediately
+ends any drag/resize and locks panel manipulation while transmission is enabled.
+
 `type` is accepted as an alias for `kind`. Positive middleware timestamps order
 safety events; an older event cannot overwrite a newer stop/resume state. Events
 without timestamps remain supported. This is UI feedback, not an additional

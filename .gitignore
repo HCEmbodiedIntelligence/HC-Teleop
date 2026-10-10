@@ -60,3 +60,6 @@ Desktop.ini
 # Embedded large SDK packages
 Packages/com.bytedance.pico.xr/
 Packages/PICO-Unity-SDK/
+
+# Local reference videos
+*.mp4

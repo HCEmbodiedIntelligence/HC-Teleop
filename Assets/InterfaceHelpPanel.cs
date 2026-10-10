@@ -15,9 +15,9 @@ public sealed class InterfaceHelpVisibility
     public bool Visible => Allowed && (Pinned || (!dismissed && buttonPointers.Count > 0));
     public bool Pinned { get; private set; }
 
-    public void SetAccess(bool emergencyStopped, bool gripHeld, bool interfaceVisible)
+    public void SetAccess(bool emergencyStopped, bool gripHeld, bool interfaceVisible, bool transmissionEnabled)
     {
-        Allowed = emergencyStopped && !gripHeld && interfaceVisible;
+        Allowed = (emergencyStopped || !transmissionEnabled) && !gripHeld && interfaceVisible;
         if (!Allowed) Reset();
     }
 
@@ -68,7 +68,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
             new Entry("左手 X / Y · 录制", "X 开始录制，Y 停止录制。\n需连接中间件并开启 UDP。"),
             new Entry("右侧圆圈键 · 界面复位", "长按系统圆圈键，系统复位完成\n后界面回到眼前；短按打开系统。"),
             new Entry("双摇杆按下 · 显示 / 隐藏", "同时按下左右摇杆切换所有界面。\n两边都松开后，再按可切换回来。"),
-            new Entry("射线 + 扳机 · 点击", "将手柄射线指向按钮，扣动扳机。\n急停且松开双手握把后可查看说明。")
+            new Entry("射线 + 扳机 · 点击", "急停或关闭 UDP 后，松开双手握把。\n指向问号查看，点击问号固定。")
         },
         new[]
         {
@@ -104,7 +104,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
             new Entry("左右扳机 · 夹爪", "控制对应夹爪开合。\n扳机同时也用于界面点击。"),
             new Entry("左侧握把 · 底盘 / 腰部", "配合摇杆 / 头部动作控制底盘、\n腰部；仅适用于支持该功能的机器人。"),
             new Entry("摇杆向外拨 · 机器人回零", "左杆向左、右杆向右：机器人回零。\n向下按两摇杆才是界面显隐。"),
-            new Entry("查看说明期间", "仅急停且双手握把松开时可查看。\n恢复或按下任一握把会收起说明。")
+            new Entry("查看说明期间", "急停或关闭 UDP 时可查看说明。\n按下任一握把或恢复遥操作会收起。")
         }
     };
 
@@ -230,7 +230,8 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
             poseSender = FindObjectOfType<UdpPoseSender>(true);
         visibility.SetAccess(poseSender != null && poseSender.IsEmergencyStopped,
             IsGripHeld(XRNode.LeftHand) || IsGripHeld(XRNode.RightHand),
-            InterfaceVisibilityController.IsInterfaceVisible);
+            InterfaceVisibilityController.IsInterfaceVisible,
+            poseSender != null && poseSender.IsTransmissionEnabled);
         if (helpButton != null) helpButton.interactable = visibility.Allowed;
     }
 

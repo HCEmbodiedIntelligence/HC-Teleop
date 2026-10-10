@@ -159,39 +159,56 @@ public static class InterfaceHelpRegression
         Call(state, "TogglePin");
         Expect(state, false, false, "unknown initial safety state blocks help");
         foreach (bool stopped in new[] { false, true })
+        foreach (bool transmitting in new[] { false, true })
         foreach (bool grip in new[] { false, true })
         foreach (bool shown in new[] { false, true })
         {
             Call(state, "Reset");
-            Call(state, "SetAccess", stopped, grip, shown);
+            Call(state, "SetAccess", stopped, grip, shown, transmitting);
             Enter(state, 70);
-            bool allowed = stopped && !grip && shown;
+            bool allowed = (stopped || !transmitting) && !grip && shown;
             Expect(state, allowed, false, "hover respects emergency, grip and visibility gates");
             Call(state, "TogglePin");
             Expect(state, allowed, allowed, "click respects emergency, grip and visibility gates");
         }
-        Call(state, "SetAccess", true, false, true);
+        Call(state, "SetAccess", true, false, true, true);
         Enter(state, 70);
         Call(state, "TogglePin");
-        Call(state, "SetAccess", true, true, true);
+        Call(state, "SetAccess", true, true, true, true);
         Expect(state, false, false, "grip press immediately closes pinned help");
         Call(state, "TogglePin");
         Enter(state, 71);
-        Call(state, "SetAccess", true, false, true);
+        Call(state, "SetAccess", true, false, true, true);
         Expect(state, false, false, "grip release cannot restore stale hover or pin");
         Enter(state, 71);
         Expect(state, true, false, "fresh hover after grip release opens help");
         Call(state, "TogglePin");
-        Call(state, "SetAccess", false, false, true);
+        Call(state, "SetAccess", false, false, true, true);
         Expect(state, false, false, "confirmed safety resume closes pinned help");
-        Call(state, "SetAccess", true, false, true);
+        Call(state, "SetAccess", true, false, true, true);
         Expect(state, false, false, "another stop does not resurrect previous help");
+
+        Call(state, "SetAccess", false, false, true, false);
+        Enter(state, 72);
+        Call(state, "TogglePin");
+        Expect(state, true, true, "UDP off permits pinned help without an emergency or receiver");
+        Call(state, "SetAccess", false, false, true, true);
+        Expect(state, false, false, "enabling UDP outside emergency closes pinned help");
+        Call(state, "SetAccess", false, false, true, false);
+        Expect(state, false, false, "disabling UDP does not restore stale hover or pin");
+        Enter(state, 72);
+        Call(state, "TogglePin");
+        Call(state, "SetAccess", true, false, true, false);
+        Call(state, "SetAccess", false, false, true, false);
+        Expect(state, true, true, "safety resume while UDP remains off keeps help available");
+        Call(state, "SetAccess", false, true, true, false);
+        Expect(state, false, false, "grip still closes help with UDP off");
     }
 
     private static object NewState()
     {
         object state = Activator.CreateInstance(visibilityType);
-        Call(state, "SetAccess", true, false, true);
+        Call(state, "SetAccess", true, false, true, true);
         return state;
     }
     private static void Enter(object state, int pointerId) { Call(state, "Enter", pointerId); }

@@ -53,6 +53,14 @@ public static class InterfaceHelpEditorChecks
             Require(!popup.gameObject.activeSelf, "help initially closed");
             EventSystem events = Child(root.transform, "Events", typeof(EventSystem)).GetComponent<EventSystem>();
             PointerEventData pointer = new PointerEventData(events) { pointerId = 101 };
+            FieldInfo transmission = typeof(UdpPoseSender).GetField("transmissionEnabled", BindingFlags.NonPublic | BindingFlags.Instance);
+            transmission.SetValue(sender, false);
+            ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerEnterHandler);
+            Require(popup.gameObject.activeSelf, "UDP off allows help without receiver or emergency");
+            trigger.GetComponent<Button>().onClick.Invoke();
+            transmission.SetValue(sender, true);
+            typeof(InterfaceHelpPanel).GetMethod("LateUpdate", BindingFlags.NonPublic | BindingFlags.Instance).Invoke(help, null);
+            Require(!popup.gameObject.activeSelf, "enabling UDP closes pinned help outside emergency");
             ExecuteEvents.Execute(trigger.gameObject, pointer, ExecuteEvents.pointerEnterHandler);
             trigger.GetComponent<Button>().onClick.Invoke();
             Require(!popup.gameObject.activeSelf, "non-emergency hover and click cannot open help");

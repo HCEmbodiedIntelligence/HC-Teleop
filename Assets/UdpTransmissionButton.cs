@@ -145,9 +145,9 @@ public class UdpTransmissionButton : MonoBehaviour
     {
         // 标题；旧版运行时生成的版本徽标也要隐藏，避免场景中残留。
         GameObject titleObj = PlainObject(panel, "HeaderTitleGroup");
-        ConfigureRect(titleObj.GetComponent<RectTransform>(), new Vector2(-280f, 238f), new Vector2(260f, 40f));
-        TMP_Text title = Label(titleObj.transform, "Brand", "HC-TELEOP", new Vector2(-30f, 0f),
-            new Vector2(160f, 36f), 24f, TextAlignmentOptions.MidlineLeft, FontStyles.Bold);
+        ConfigureRect(titleObj.GetComponent<RectTransform>(), new Vector2(-335f, 238f), new Vector2(165f, 40f));
+        TMP_Text title = Label(titleObj.transform, "Brand", "HC-TELEOP", Vector2.zero,
+            new Vector2(165f, 36f), 24f, TextAlignmentOptions.MidlineLeft, FontStyles.Bold);
         title.color = colorActiveCyan;
         Transform legacyTag = titleObj.transform.Find("Tag");
         if (legacyTag != null)
@@ -158,13 +158,17 @@ public class UdpTransmissionButton : MonoBehaviour
         // Top row: device information ends 15 px before the help hit area.
         // Connection text has its own non-overlapping area to the left.
         headsetStatusText = Label(panel, "HeadsetStatus", "", Vector2.zero,
-            new Vector2(300f, 28f), 18f, TextAlignmentOptions.MidlineRight, FontStyles.Normal);
+            new Vector2(195f, 28f), 15f, TextAlignmentOptions.MidlineRight, FontStyles.Normal);
         RectTransform deviceRect = headsetStatusText.rectTransform;
         deviceRect.anchorMin = deviceRect.anchorMax = Vector2.one;
         deviceRect.pivot = new Vector2(1f, 0.5f);
         deviceRect.anchoredPosition = new Vector2(-98f, -42f);
+        deviceRect.sizeDelta = new Vector2(195f, 28f);
         headsetStatusText.color = colorTextMuted;
         headsetStatusText.overflowMode = TextOverflowModes.Ellipsis;
+        headsetStatusText.enableAutoSizing = true;
+        headsetStatusText.fontSizeMin = 12f;
+        headsetStatusText.fontSizeMax = 15f;
         RefreshHeadsetStatus();
     }
 
@@ -199,22 +203,23 @@ public class UdpTransmissionButton : MonoBehaviour
 
         statusText.transform.SetParent(panel, false);
         RectTransform rect = statusText.rectTransform;
-        // Preserve the original header height and left edge (x=-200, y=238).
-        // End at x=40, before device information starts at x=52.
+        // Expanded header display area: starts at x=-242 (anchoredPosition.x=208),
+        // width 390 ends at x=+148 before headsetStatusText at x=157.
+        // Height 48 allows clean multi-line display centered at y=238.
         rect.anchorMin = rect.anchorMax = new Vector2(0f, 0.5f);
         rect.pivot = new Vector2(0f, 0.5f);
-        rect.anchoredPosition = new Vector2(250f, 238f);
-        rect.sizeDelta = new Vector2(240f, 38f);
+        rect.anchoredPosition = new Vector2(208f, 238f);
+        rect.sizeDelta = new Vector2(390f, 48f);
         rect.localScale = Vector3.one;
         rect.localRotation = Quaternion.identity;
         // The scene's legacy TMP margins exceed this header area's width.
         // Reset them explicitly or ellipsis can suppress the entire label.
         statusText.margin = Vector4.zero;
         statusText.raycastTarget = false;
-        statusText.enableWordWrapping = false;
+        statusText.enableWordWrapping = true;
         statusText.enableAutoSizing = true;
-        statusText.fontSizeMin = 14f;
-        statusText.fontSizeMax = 18f;
+        statusText.fontSizeMin = 12f;
+        statusText.fontSizeMax = 16f;
         statusText.alignment = TextAlignmentOptions.MidlineLeft;
         statusText.overflowMode = TextOverflowModes.Ellipsis;
         statusText.color = new Color(0.72f, 0.78f, 0.88f, 1f);
@@ -846,6 +851,11 @@ public class UdpTransmissionButton : MonoBehaviour
 
     private void ToggleUdp()
     {
+        if (poseSender != null && poseSender.IsOccupiedByOther && !poseSender.IsTransmissionEnabled)
+        {
+            Debug.LogWarning("[VR Teleop] 中间件已被其他头显占用，无法开启 UDP！");
+            return;
+        }
         poseSender?.ToggleTransmission();
     }
 
@@ -873,8 +883,19 @@ public class UdpTransmissionButton : MonoBehaviour
         // 1. 顶部网络与录制状态
         if (statusText != null)
         {
-            string pc = string.IsNullOrEmpty(poseSender.ReceiverAddress)
-                ? "<color=#FFB826>未连接</color>" : "<color=#00E676>" + poseSender.ReceiverAddress + "</color>";
+            string pc;
+            if (string.IsNullOrEmpty(poseSender.ReceiverAddress))
+            {
+                pc = "<color=#FFB826>未连接</color>";
+            }
+            else if (poseSender.IsOccupiedByOther)
+            {
+                pc = poseSender.ReceiverAddress + "   <color=#FF3852>[被占用: " + poseSender.OccupiedPeerIp + "]</color>";
+            }
+            else
+            {
+                pc = "<color=#00E676>" + poseSender.ReceiverAddress + "</color>";
+            }
             string recInfo = "";
             if (poseSender.IsRecording)
             {
@@ -905,22 +926,23 @@ public class UdpTransmissionButton : MonoBehaviour
 
         // 2. UDP 传输控制状态
         bool emergencyStopped = poseSender.IsEmergencyStopped;
+        bool isOccupied = poseSender.IsOccupiedByOther && !poseSender.IsTransmissionEnabled;
         if (emergencyBanner != null)
             emergencyBanner.gameObject.SetActive(emergencyStopped);
         if (emergencyText != null && emergencyStopped)
             emergencyText.text = "急停：" + poseSender.EmergencyStopMessage
                 + "\n" + (poseSender.HasReceiver ? "排除故障后按 A 恢复，等待中间件确认" : "连接已断开，等待中间件重新连接并确认恢复");
-        Color udpColor = emergencyStopped ? colorActiveRed : !poseSender.IsTransmissionEnabled
+        Color udpColor = emergencyStopped ? colorActiveRed : isOccupied ? colorOffRed : !poseSender.IsTransmissionEnabled
             ? colorOffRed : poseSender.HasReceiver ? colorActiveGreen : colorWarningAmber;
         if (udpRing != null) udpRing.color = udpColor;
         if (udpCaption != null)
-            udpCaption.text = emergencyStopped ? "已急停 / 按A恢复" : poseSender.IsTransmissionEnabled ? "按B关闭 (UDP)" : "按A开启 (UDP)";
+            udpCaption.text = emergencyStopped ? "已急停 / 按A恢复" : isOccupied ? "被占用 / 无法开启" : poseSender.IsTransmissionEnabled ? "按B关闭 (UDP)" : "按A开启 (UDP)";
         if (udpCaption != null)
-            udpCaption.color = emergencyStopped ? colorActiveRed : Color.white;
+            udpCaption.color = emergencyStopped || isOccupied ? colorActiveRed : Color.white;
         if (udpIcon != null)
         {
-            udpIcon.text = emergencyStopped ? "急停" : "UDP";
-            udpIcon.color = emergencyStopped ? colorActiveRed : poseSender.IsTransmissionEnabled ? colorActiveGreen : Color.white;
+            udpIcon.text = emergencyStopped ? "急停" : isOccupied ? "占用" : "UDP";
+            udpIcon.color = emergencyStopped || isOccupied ? colorActiveRed : poseSender.IsTransmissionEnabled ? colorActiveGreen : Color.white;
         }
 
         // 3. CAM 相机控制状态

@@ -103,6 +103,8 @@ public class UdpPoseSender : MonoBehaviour
 {
     private const string DiscoveryRequest = "PICO_DISCOVER_V1";
     private const string DiscoveryResponsePrefix = "PICO_RECEIVER_V1|";
+    private const string DiscoveryBusyPrefix = "PICO_RECEIVER_BUSY|";
+    private const string ReleaseRequest = "PICO_RELEASE_V1";
     private const byte ProtocolVersion = 2;
 
     [Flags]
@@ -239,6 +241,7 @@ public class UdpPoseSender : MonoBehaviour
     private int addressRefreshPending;
     private int addressRefreshReady;
     private readonly byte[] discoveryRequestBytes = Encoding.ASCII.GetBytes(DiscoveryRequest);
+    private readonly byte[] releaseRequestBytes = Encoding.ASCII.GetBytes(ReleaseRequest);
     private long lastCaptureTicks;
     private long lastSuccessfulSendTicks;
     private long maxCaptureGapTicks;
@@ -253,6 +256,8 @@ public class UdpPoseSender : MonoBehaviour
 
     public bool IsTransmissionEnabled => transmissionEnabled;
     public bool HasReceiver => receiverEndPoint != null;
+    public bool IsOccupiedByOther { get; private set; }
+    public string OccupiedPeerIp { get; private set; }
     public string LocalIpAddress => localIpAddress;
     public string ReceiverIpAddress => receiverEndPoint == null
         ? string.Empty
@@ -354,16 +359,24 @@ public class UdpPoseSender : MonoBehaviour
         bool desiredTransmission = transmissionButtons.Update(transmissionEnabled, rightInput.held);
         if (desiredTransmission != transmissionEnabled)
         {
-            SetTransmissionEnabled(desiredTransmission);
-            if (desiredTransmission)
+            if (desiredTransmission && IsOccupiedByOther)
             {
-                TriggerHapticImpulse(XRNode.RightHand, 0.75f, 0.15f);
-                Debug.Log("[Teleop] 右手 A 键按下 -> 开启遥操作传输");
+                TriggerHapticImpulse(XRNode.RightHand, 0.4f, 0.1f);
+                Debug.LogWarning("[Teleop] 中间件已被其他头显占用 (" + OccupiedPeerIp + ")，无法开启");
             }
             else
             {
-                StartCoroutine(TriggerDoubleHapticImpulse(XRNode.RightHand));
-                Debug.Log("[Teleop] 右手 B 键按下 -> 关闭遥操作传输");
+                SetTransmissionEnabled(desiredTransmission);
+                if (desiredTransmission)
+                {
+                    TriggerHapticImpulse(XRNode.RightHand, 0.75f, 0.15f);
+                    Debug.Log("[Teleop] 右手 A 键按下 -> 开启遥操作传输");
+                }
+                else
+                {
+                    StartCoroutine(TriggerDoubleHapticImpulse(XRNode.RightHand));
+                    Debug.Log("[Teleop] 右手 B 键按下 -> 关闭遥操作传输");
+                }
             }
         }
 
@@ -500,19 +513,50 @@ public class UdpPoseSender : MonoBehaviour
                 string response = Encoding.ASCII.GetString(
                     discoveryClient.Receive(ref sender)).Trim();
 
+                if (response.StartsWith(DiscoveryBusyPrefix, StringComparison.Ordinal))
+                {
+                    string payload = response.Substring(DiscoveryBusyPrefix.Length);
+                    string[] parts = payload.Split('|');
+                    string portText = parts.Length > 0 ? parts[0] : "";
+                    string occupiedBy = parts.Length > 1 ? parts[1] : "其他设备";
+                    if (int.TryParse(portText, out int busyPosePort) && busyPosePort >= 1 && busyPosePort <= 65535)
+                    {
+                        bool wasOccupied = IsOccupiedByOther;
+                        bool sameReceiver = receiverEndPoint != null &&
+                            receiverEndPoint.Address.Equals(sender.Address);
+                        if (receiverEndPoint == null || sameReceiver)
+                        {
+                            receiverEndPoint = new IPEndPoint(sender.Address, busyPosePort);
+                            lastReceiverReplyTime = now;
+                            IsOccupiedByOther = true;
+                            OccupiedPeerIp = occupiedBy;
+                            if (!wasOccupied)
+                            {
+                                Debug.LogWarning("[VR Teleop] 中间件已被占用: " + occupiedBy);
+                                NetworkStatusChanged?.Invoke();
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if (!response.StartsWith(DiscoveryResponsePrefix, StringComparison.Ordinal))
                     continue;
 
-                string portText = response.Substring(DiscoveryResponsePrefix.Length);
-                if (!int.TryParse(portText, out int posePort) || posePort < 1 || posePort > 65535)
+                string portTextVal = response.Substring(DiscoveryResponsePrefix.Length);
+                if (!int.TryParse(portTextVal, out int posePort) || posePort < 1 || posePort > 65535)
                     continue;
 
-                bool sameReceiver = receiverEndPoint != null &&
+                bool isSameReceiver = receiverEndPoint != null &&
                     receiverEndPoint.Address.Equals(sender.Address);
-                if (receiverEndPoint != null && !sameReceiver)
+                if (receiverEndPoint != null && !isSameReceiver)
                     continue;
 
-                bool changed = receiverEndPoint == null || receiverEndPoint.Port != posePort;
+                bool wasOccupiedState = IsOccupiedByOther;
+                IsOccupiedByOther = false;
+                OccupiedPeerIp = null;
+
+                bool changed = receiverEndPoint == null || receiverEndPoint.Port != posePort || wasOccupiedState;
                 receiverEndPoint = new IPEndPoint(sender.Address, posePort);
                 lastReceiverReplyTime = now;
 
@@ -1211,7 +1255,10 @@ public class UdpPoseSender : MonoBehaviour
     {
         poseSenderActive = false;
         if (sendStopPacket && transmissionEnabled)
+        {
             SendPosePacket(Time.realtimeSinceStartupAsDouble, true);
+            SendReleaseRequest();
+        }
 
         poseSendThreadStopping = true;
         if (poseSendThread != null && poseSendThread.IsAlive)
@@ -1225,6 +1272,26 @@ public class UdpPoseSender : MonoBehaviour
         poseClient = null;
         discoveryClient = null;
         receiverEndPoint = null;
+    }
+
+    public void SendReleaseRequest()
+    {
+        if (receiverEndPoint == null || discoveryClient == null)
+            return;
+
+        try
+        {
+            byte[] data = releaseRequestBytes;
+            discoveryClient.Send(data, data.Length, new IPEndPoint(receiverEndPoint.Address, discoveryPort));
+            if (poseClient != null)
+            {
+                poseClient.Send(data, data.Length, receiverEndPoint);
+            }
+        }
+        catch (Exception exception)
+        {
+            Debug.LogWarning("UDP release send failed: " + exception.Message);
+        }
     }
 
     public static void TriggerHapticImpulse(XRNode node, float amplitude = 0.7f, float duration = 0.12f)
@@ -1250,10 +1317,17 @@ public class UdpPoseSender : MonoBehaviour
         if (transmissionEnabled == enabled)
             return;
 
+        if (enabled && IsOccupiedByOther)
+        {
+            Debug.LogWarning("[VR Teleop] 中间件已被其他头显占用 (" + OccupiedPeerIp + ")，无法开启遥操作传输");
+            return;
+        }
+
         if (!enabled)
         {
             poseSenderActive = false;
             SendPosePacket(Time.realtimeSinceStartupAsDouble, true);
+            SendReleaseRequest();
         }
 
         transmissionEnabled = enabled;

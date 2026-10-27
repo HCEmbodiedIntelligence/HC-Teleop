@@ -52,6 +52,8 @@ public class UdpTransmissionButton : MonoBehaviour
     private Image leftStatusDot;
     private Image rightStatusDot;
     private TMP_Text trackingSummaryText;
+    private TMP_Text headsetStatusText;
+    private float headsetStatusRefreshTimer;
 
     private float refreshTimer;
 
@@ -152,6 +154,42 @@ public class UdpTransmissionButton : MonoBehaviour
             legacyTag.gameObject.SetActive(false);
 
         ConfigureStatusText(panel);
+
+        // Top row: device information ends 15 px before the help hit area.
+        // Connection text has its own non-overlapping area to the left.
+        headsetStatusText = Label(panel, "HeadsetStatus", "", Vector2.zero,
+            new Vector2(300f, 28f), 18f, TextAlignmentOptions.MidlineRight, FontStyles.Normal);
+        RectTransform deviceRect = headsetStatusText.rectTransform;
+        deviceRect.anchorMin = deviceRect.anchorMax = Vector2.one;
+        deviceRect.pivot = new Vector2(1f, 0.5f);
+        deviceRect.anchoredPosition = new Vector2(-98f, -42f);
+        headsetStatusText.color = colorTextMuted;
+        headsetStatusText.overflowMode = TextOverflowModes.Ellipsis;
+        RefreshHeadsetStatus();
+    }
+
+    private void RefreshHeadsetStatus()
+    {
+        if (headsetStatusText == null)
+            return;
+
+        // In the editor, do not mistake the development PC battery for the HMD.
+        float level = -1f;
+        BatteryStatus batteryStatus = BatteryStatus.Unknown;
+#if UNITY_ANDROID && !UNITY_EDITOR
+        level = SystemInfo.batteryLevel;
+        batteryStatus = SystemInfo.batteryStatus;
+#endif
+        bool known = !float.IsNaN(level) && level >= 0f && level <= 1f;
+        int percent = known ? Mathf.RoundToInt(level * 100f) : 0;
+        bool charging = batteryStatus == BatteryStatus.Charging;
+        string battery = known ? percent + "%" : "--";
+        string color = charging || batteryStatus == BatteryStatus.Full
+            ? "#0FF08A" : known && percent <= 20 ? "#FFBC29" : "#ABBFDB";
+        string chargeLabel = charging ? " · 充电中" :
+            batteryStatus == BatteryStatus.Full ? " · 已充满" : string.Empty;
+        headsetStatusText.text = DateTime.Now.ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture) +
+            "  ·  头显 <color=" + color + ">" + battery + chargeLabel + "</color>";
     }
 
     private void ConfigureStatusText(Transform panel)
@@ -161,16 +199,24 @@ public class UdpTransmissionButton : MonoBehaviour
 
         statusText.transform.SetParent(panel, false);
         RectTransform rect = statusText.rectTransform;
-        rect.anchorMin = rect.anchorMax = rect.pivot = new Vector2(0.5f, 0.5f);
-        // Leave a separate hit area for the help button at the top right.
-        rect.anchoredPosition = new Vector2(75f, 238f);
-        rect.sizeDelta = new Vector2(550f, 38f);
+        // Preserve the original header height and left edge (x=-200, y=238).
+        // End at x=40, before device information starts at x=52.
+        rect.anchorMin = rect.anchorMax = new Vector2(0f, 0.5f);
+        rect.pivot = new Vector2(0f, 0.5f);
+        rect.anchoredPosition = new Vector2(250f, 238f);
+        rect.sizeDelta = new Vector2(240f, 38f);
+        rect.localScale = Vector3.one;
+        rect.localRotation = Quaternion.identity;
+        // The scene's legacy TMP margins exceed this header area's width.
+        // Reset them explicitly or ellipsis can suppress the entire label.
+        statusText.margin = Vector4.zero;
         statusText.raycastTarget = false;
         statusText.enableWordWrapping = false;
         statusText.enableAutoSizing = true;
         statusText.fontSizeMin = 14f;
         statusText.fontSizeMax = 18f;
-        statusText.alignment = TextAlignmentOptions.MidlineRight;
+        statusText.alignment = TextAlignmentOptions.MidlineLeft;
+        statusText.overflowMode = TextOverflowModes.Ellipsis;
         statusText.color = new Color(0.72f, 0.78f, 0.88f, 1f);
     }
 
@@ -745,6 +791,8 @@ public class UdpTransmissionButton : MonoBehaviour
 
     private void OnEnable()
     {
+        headsetStatusRefreshTimer = 0f;
+        RefreshHeadsetStatus();
         if (udpButton != null)
             udpButton.onClick.AddListener(ToggleUdp);
         if (poseSender != null)
@@ -769,6 +817,13 @@ public class UdpTransmissionButton : MonoBehaviour
 
     private void Update()
     {
+        // Device information remains available when UDP is off or unassigned.
+        headsetStatusRefreshTimer += Time.unscaledDeltaTime;
+        if (headsetStatusRefreshTimer >= 1f)
+        {
+            headsetStatusRefreshTimer = 0f;
+            RefreshHeadsetStatus();
+        }
         refreshTimer += Time.unscaledDeltaTime;
         if (refreshTimer >= statusRefreshInterval)
         {

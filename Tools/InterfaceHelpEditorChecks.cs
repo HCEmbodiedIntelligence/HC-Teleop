@@ -41,8 +41,13 @@ public static class InterfaceHelpEditorChecks
             toolbar.statusText = Child(panel.transform, "Status", typeof(RectTransform), typeof(TextMeshProUGUI)).GetComponent<TMP_Text>();
             toolbar.buttonText.font = toolbar.statusText.font = font;
             toolbar.statusText.text = "PICO  ⇄  PC  未连接";
+            // Reproduce the scene's old margins, which previously hid the label.
+            toolbar.statusText.margin = new Vector4(0f, 0f, 411.79642f, -51.34088f);
             typeof(UdpTransmissionButton).GetField("udpButton", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(toolbar, udpObj.GetComponent<Button>());
             typeof(UdpTransmissionButton).GetMethod("BuildInterface", BindingFlags.NonPublic | BindingFlags.Instance).Invoke(toolbar, null);
+            Require(toolbar.statusText.margin == Vector4.zero, "header clears legacy connection-text margins");
+            toolbar.statusText.ForceMeshUpdate();
+            Require(toolbar.statusText.textInfo.meshInfo[0].vertexCount > 0, "connection status generates visible geometry");
             InterfaceHelpPanel help = panel.GetComponentInChildren<InterfaceHelpPanel>(true);
             UdpPoseSender sender = Child(root.transform, "SafetyState").AddComponent<UdpPoseSender>();
             typeof(InterfaceHelpPanel).GetField("poseSender", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(help, sender);

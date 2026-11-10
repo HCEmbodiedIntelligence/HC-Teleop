@@ -188,12 +188,19 @@ public class UdpTransmissionButton : MonoBehaviour
         int percent = known ? Mathf.RoundToInt(level * 100f) : 0;
         bool charging = batteryStatus == BatteryStatus.Charging;
         string battery = known ? percent + "%" : "--";
-        string color = charging || batteryStatus == BatteryStatus.Full
-            ? "#0FF08A" : known && percent <= 20 ? "#FFBC29" : "#ABBFDB";
+        string color = GetHeadsetBatteryColor(known, percent, batteryStatus);
         string chargeLabel = charging ? " · 充电中" :
             batteryStatus == BatteryStatus.Full ? " · 已充满" : string.Empty;
         headsetStatusText.text = DateTime.Now.ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture) +
             "  ·  头显 <color=" + color + ">" + battery + chargeLabel + "</color>";
+    }
+
+    internal static string GetHeadsetBatteryColor(bool known, int percent, BatteryStatus status)
+    {
+        if (!known) return "#ABBFDB";
+        if (percent <= 10) return "#FF3852";
+        if (percent <= 20) return "#FFBC29";
+        return status == BatteryStatus.Charging || status == BatteryStatus.Full ? "#0FF08A" : "#ABBFDB";
     }
 
     private void ConfigureStatusText(Transform panel)
@@ -921,7 +928,18 @@ public class UdpTransmissionButton : MonoBehaviour
             {
                 replayInfo = "   <color=#FFB826>[重放已暂停]</color>";
             }
-            statusText.text = "PICO  " + poseSender.LocalIpAddress + "  ⇄  PC  " + pc + recInfo + replayInfo;
+            bool canChooseSource = poseSender.DeviceSources.Length > 1 ||
+                (poseSender.DeviceSources.Length == 1 && !poseSender.HasReceiver);
+            if (!poseSender.HasReceiver) pc = "<color=#FFB826>" +
+                (poseSender.DeviceSources.Length > 1 ? "请选择设备源" : "正在发现设备源") + "</color>";
+            // Keep the dropdown affordance at the start so long status messages
+            // cannot ellipsize away the only visible source-selection hint.
+            statusText.text = canChooseSource
+                ? "选择设备源 ▾  " + pc + "\nPICO  " + poseSender.LocalIpAddress + recInfo + replayInfo
+                : "PICO  " + poseSender.LocalIpAddress + "  ⇄  PC  " + pc + recInfo + replayInfo;
+            DeviceSourceSelector selector = statusText.GetComponent<DeviceSourceSelector>();
+            if (selector == null) selector = statusText.gameObject.AddComponent<DeviceSourceSelector>();
+            selector.Configure(poseSender, statusText.transform.parent as RectTransform);
         }
 
         // 2. UDP 传输控制状态

@@ -1,5 +1,39 @@
 # HC Teleop UDP protocol v2
 
+## Device source selection and camera ownership
+
+Discovery continues on UDP 5006 even after a source is selected, using the
+existing `PICO_DISCOVER_V1`, `PICO_RECEIVER_V1|port` and
+`PICO_RECEIVER_BUSY|port|owner_ip` messages. Replies are inventoried by IP and
+expire after `receiverTimeoutSeconds` (default 6 seconds). A single source is
+selected automatically after a 1.5 second collection window. Multiple sources
+require selecting an IP from the clickable connection-status dropdown. A second
+source discovered after automatic selection also requires an explicit choice.
+Explicit selection never rotates with reply order, and a missing selected source
+is never silently replaced by a different robot. Click the status label to choose
+the remaining source if needed.
+
+Switching or losing a source stops UDP, sends the existing invalid-pose/release
+messages to the old source, closes camera peers and clears old frames and remote
+UI state. Press A to enable transmission on the selected source. Middleware
+events are accepted only from the currently selected IP.
+
+Discovery availability is not ownership. While transmission is enabled, the VR
+polls the selected middleware's existing `GET /api/status` on
+`UdpPoseSender.deviceStatusPort` (default 7876) every 0.5 seconds. Cameras require
+`vr.is_locked == true` and `vr.active_peer` matching one of this headset's local
+IPv4 addresses. Busy replies, UDP off, source changes, ownership by another VR,
+missing/failed status, or a snapshot older than 2.5 seconds deny camera access.
+Ownership revocation also cancels in-flight signaling. Camera panel visibility
+does not grant access; unauthorized panels display a waiting message.
+
+This uses the existing middleware API and requires its exclusive-session mode.
+There is no permissive fallback for older middleware without ownership status.
+Install the updated VR client on all headsets to prevent older clients continuing
+to submit camera offers. No middleware source files were changed here.
+
+Managed selection/ownership checks: `Tools/DeviceSourcesRegression.cs`.
+
 All numeric fields use little-endian byte order. The complete packet is 162 bytes.
 
 Python format string:

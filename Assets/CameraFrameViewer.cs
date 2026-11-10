@@ -62,6 +62,7 @@ public class CameraFrameViewer : MonoBehaviour
     private Coroutine statsCoroutine;
     private string currentServerIp = string.Empty;
     private string activeConnectionServerIp = string.Empty;
+    private UnityWebRequest signalingRequest;
     private string activeConnectionStreamId = string.Empty;
     private string activeConnectionOfferPath = string.Empty;
     private string connectionState = "等待发现 PC";
@@ -483,6 +484,23 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void Update()
     {
+        if (poseSender != null && (!poseSender.HasCameraControl ||
+            (!string.IsNullOrEmpty(activeConnectionServerIp) && activeConnectionServerIp != poseSender.ReceiverIpAddress)))
+        {
+            if (connectionCoroutine != null && (!string.IsNullOrEmpty(activeConnectionServerIp) || peerConnection != null))
+            {
+                StopCoroutine(connectionCoroutine);
+                connectionCoroutine = null;
+            }
+            if (peerConnection != null || receivedVideoTrack != null ||
+                (targetImage != null && targetImage.texture != null))
+                ClosePeerConnection(true);
+            currentServerIp = string.Empty;
+            activeConnectionServerIp = string.Empty;
+            connectionNeedsRestart = false;
+            connectionState = "等待本机取得控制权";
+            EnsureRuntimeCoroutines();
+        }
         statusRefreshTimer += Time.unscaledDeltaTime;
         if (statusRefreshTimer >= 0.25f)
         {
@@ -544,6 +562,12 @@ public class CameraFrameViewer : MonoBehaviour
             }
 
             string discoveredIp = poseSender.ReceiverIpAddress;
+            if (!poseSender.HasCameraControl)
+            {
+                connectionState = "等待本机取得控制权";
+                yield return new WaitForSecondsRealtime(0.25f);
+                continue;
+            }
             if (!string.IsNullOrEmpty(discoveredIp))
             {
                 if (string.IsNullOrEmpty(currentServerIp))
@@ -579,7 +603,8 @@ public class CameraFrameViewer : MonoBehaviour
 
             connectionNeedsRestart = false;
             Debug.Log($"[Camera WebRTC] {streamId} -> http://{currentServerIp}:{videoPort}{offerPath}");
-            yield return StartCoroutine(ConnectToServer(currentServerIp));
+            // Yield the enumerator directly so cancellation also stops negotiation.
+            yield return ConnectToServer(currentServerIp);
 
             if (peerConnection == null || connectionNeedsRestart)
             {
@@ -599,6 +624,8 @@ public class CameraFrameViewer : MonoBehaviour
 
     private IEnumerator ConnectToServer(string serverIp)
     {
+        if (poseSender == null || !poseSender.HasCameraControl || poseSender.ReceiverIpAddress != serverIp)
+            yield break;
         connectionState = "正在协商 WebRTC";
         lastError = string.Empty;
         activeConnectionServerIp = serverIp;
@@ -684,13 +711,19 @@ public class CameraFrameViewer : MonoBehaviour
 
         using (var request = new UnityWebRequest(url, UnityWebRequest.kHttpVerbPOST))
         {
+            if (!poseSender.HasCameraControl || poseSender.ReceiverIpAddress != serverIp)
+                yield break;
             request.uploadHandler = new UploadHandlerRaw(body);
             request.downloadHandler = new DownloadHandlerBuffer();
             request.SetRequestHeader("Content-Type", "application/json");
             // 给服务端 ICE gathering（最多 2s）+ 网络往返留足余量
             // 必须 > 服务端 ICE gather 上限（2s）+ Answer 序列化/传输时间
             request.timeout = 12;
+            signalingRequest = request;
             yield return request.SendWebRequest();
+            signalingRequest = null;
+            if (!poseSender.HasCameraControl || poseSender.ReceiverIpAddress != serverIp)
+                yield break;
 
             if (request.result != UnityWebRequest.Result.Success)
             {
@@ -1190,6 +1223,12 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void ClosePeerConnection(bool clearTexture = false)
     {
+        if (signalingRequest != null)
+        {
+            try { signalingRequest.Abort(); }
+            catch (ObjectDisposedException) { }
+            signalingRequest = null;
+        }
         if (receivedVideoTrack != null)
             receivedVideoTrack.OnVideoReceived -= OnVideoReceived;
         receivedVideoTrack = null;

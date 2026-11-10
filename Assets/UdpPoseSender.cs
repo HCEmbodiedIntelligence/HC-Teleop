@@ -43,6 +43,12 @@ public sealed class MiddlewareSafetyState
     public bool IsEmergencyStopped { get; private set; }
     public string EmergencyStopReason { get; private set; }
     private double lastSafetyTimestamp = double.NegativeInfinity;
+    public void ResetForSourceChange()
+    {
+        IsEmergencyStopped = false;
+        EmergencyStopReason = null;
+        lastSafetyTimestamp = double.NegativeInfinity;
+    }
 
     public string EmergencyStopMessage
     {
@@ -99,7 +105,7 @@ public sealed class TransmissionButtonState
     }
 }
 
-public class UdpPoseSender : MonoBehaviour
+public partial class UdpPoseSender : MonoBehaviour
 {
     private const string DiscoveryRequest = "PICO_DISCOVER_V1";
     private const string DiscoveryResponsePrefix = "PICO_RECEIVER_V1|";
@@ -316,6 +322,7 @@ public class UdpPoseSender : MonoBehaviour
             nextIpRefreshTime = now;
             RefreshLocalIp();
             StartPoseSendThread();
+            ownershipCoroutine = StartCoroutine(CameraOwnershipLoop());
             poseSenderActive = transmissionEnabled;
             Debug.Log("UDP initialized. Searching for a PC receiver...");
         }
@@ -394,8 +401,9 @@ public class UdpPoseSender : MonoBehaviour
             rateMeasureTimer = 0;
         }
 
-        PollInboundEvents();
         PollDiscoveryReplies(now);
+        ApplySelectedSource(now);
+        PollInboundEvents();
 
         if (now >= nextDiscoveryTime)
         {
@@ -403,14 +411,6 @@ public class UdpPoseSender : MonoBehaviour
             nextDiscoveryTime = now + Math.Max(0.25, discoveryIntervalSeconds);
         }
 
-        if (receiverEndPoint != null &&
-            now - lastReceiverReplyTime > Math.Max(1f, receiverTimeoutSeconds))
-        {
-            Debug.LogWarning("PC receiver timed out. Searching again.");
-            receiverEndPoint = null;
-            currentSendRateHz = 0f;
-            NetworkStatusChanged?.Invoke();
-        }
     }
 
     private void LateUpdate()
@@ -433,10 +433,9 @@ public class UdpPoseSender : MonoBehaviour
             IPEndPoint receiver = receiverEndPoint;
             if (receiver != null)
             {
-                // A discovered receiver only needs a directed heartbeat.
+                // Keep the selected source's heartbeat while broadcasting for others.
                 discoveryClient.Send(request, request.Length,
                     new IPEndPoint(receiver.Address, discoveryPort));
-                return;
             }
             // 1. 全局广播 255.255.255.255
             discoveryClient.Send(request, request.Length,
@@ -461,7 +460,7 @@ public class UdpPoseSender : MonoBehaviour
             // PICO 热点、Windows 多网卡以及部分路由器会丢弃广播回复。
             // 在尚未找到接收端时，对每个有效 /24 子网分批轮询。所有
             // 网段使用同一批主机号，所以 1-254 只需约八轮即可覆盖。
-            if (receiverEndPoint == null && localAddresses.Length > 0)
+            if (localAddresses.Length > 0)
             {
                 int probes = Mathf.Clamp(discoveryUnicastBatchSize, 1, 64);
                 int firstHost = nextDiscoveryHost;
@@ -502,72 +501,14 @@ public class UdpPoseSender : MonoBehaviour
 
     private void PollDiscoveryReplies(double now)
     {
-        if (discoveryClient == null)
-            return;
-
+        if (discoveryClient == null) return;
         try
         {
             while (discoveryClient.Available > 0)
             {
                 IPEndPoint sender = new IPEndPoint(IPAddress.Any, 0);
-                string response = Encoding.ASCII.GetString(
-                    discoveryClient.Receive(ref sender)).Trim();
-
-                if (response.StartsWith(DiscoveryBusyPrefix, StringComparison.Ordinal))
-                {
-                    string payload = response.Substring(DiscoveryBusyPrefix.Length);
-                    string[] parts = payload.Split('|');
-                    string portText = parts.Length > 0 ? parts[0] : "";
-                    string occupiedBy = parts.Length > 1 ? parts[1] : "其他设备";
-                    if (int.TryParse(portText, out int busyPosePort) && busyPosePort >= 1 && busyPosePort <= 65535)
-                    {
-                        bool wasOccupied = IsOccupiedByOther;
-                        bool sameReceiver = receiverEndPoint != null &&
-                            receiverEndPoint.Address.Equals(sender.Address);
-                        if (receiverEndPoint == null || sameReceiver)
-                        {
-                            receiverEndPoint = new IPEndPoint(sender.Address, busyPosePort);
-                            lastReceiverReplyTime = now;
-                            IsOccupiedByOther = true;
-                            OccupiedPeerIp = occupiedBy;
-                            if (!wasOccupied)
-                            {
-                                Debug.LogWarning("[VR Teleop] 中间件已被占用: " + occupiedBy);
-                                NetworkStatusChanged?.Invoke();
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                if (!response.StartsWith(DiscoveryResponsePrefix, StringComparison.Ordinal))
-                    continue;
-
-                string portTextVal = response.Substring(DiscoveryResponsePrefix.Length);
-                if (!int.TryParse(portTextVal, out int posePort) || posePort < 1 || posePort > 65535)
-                    continue;
-
-                bool isSameReceiver = receiverEndPoint != null &&
-                    receiverEndPoint.Address.Equals(sender.Address);
-                if (receiverEndPoint != null && !isSameReceiver)
-                    continue;
-
-                bool wasOccupiedState = IsOccupiedByOther;
-                IsOccupiedByOther = false;
-                OccupiedPeerIp = null;
-
-                bool changed = receiverEndPoint == null || receiverEndPoint.Port != posePort || wasOccupiedState;
-                receiverEndPoint = new IPEndPoint(sender.Address, posePort);
-                lastReceiverReplyTime = now;
-
-                if (changed)
-                {
-                    nextDiscoveryHost = 1;
-                    nextSendTime = now;
-                    ResetInputHistory();
-                    Debug.Log("PC receiver discovered: " + ReceiverAddress);
-                    NetworkStatusChanged?.Invoke();
-                }
+                string response = Encoding.ASCII.GetString(discoveryClient.Receive(ref sender)).Trim();
+                sourceRegistry.Observe(sender.Address.ToString(), response, now);
             }
         }
         catch (SocketException exception)
@@ -580,7 +521,6 @@ public class UdpPoseSender : MonoBehaviour
             Debug.LogWarning("UDP discovery receive failed: " + exception.Message);
         }
     }
-
     private void PollInboundEvents()
     {
         if (eventClient == null)
@@ -592,6 +532,8 @@ public class UdpPoseSender : MonoBehaviour
             {
                 IPEndPoint sender = new IPEndPoint(IPAddress.Any, 0);
                 byte[] data = eventClient.Receive(ref sender);
+                if (receiverEndPoint == null || !sender.Address.Equals(receiverEndPoint.Address))
+                    continue;
                 if (data == null || data.Length == 0)
                     continue;
 
@@ -798,7 +740,8 @@ public class UdpPoseSender : MonoBehaviour
     private bool SendPoseSnapshot(
         PoseSnapshot snapshot,
         IPEndPoint target,
-        bool includeInputEdges)
+        bool includeInputEdges,
+        bool requireActive = false)
     {
         ControllerInputState packetLeftInput = snapshot.leftInput;
         ControllerInputState packetRightInput = snapshot.rightInput;
@@ -812,6 +755,10 @@ public class UdpPoseSender : MonoBehaviour
             lock (poseSendLock)
             {
                 if (poseClient == null || posePacketWriter == null)
+                    return false;
+                if (!target.Equals(receiverEndPoint))
+                    return false;
+                if (requireActive && !poseSenderActive)
                     return false;
                 if (snapshot.flags != 0 && (!poseSenderActive || poseSenderSuspended))
                     return false;
@@ -948,7 +895,7 @@ public class UdpPoseSender : MonoBehaviour
             if (available)
             {
                 bool includeEdges = snapshot.version != lastSentSnapshotVersion;
-                if (SendPoseSnapshot(snapshot, target, includeEdges))
+                if (SendPoseSnapshot(snapshot, target, includeEdges, true))
                     lastSentSnapshotVersion = snapshot.version;
             }
 
@@ -1253,6 +1200,9 @@ public class UdpPoseSender : MonoBehaviour
 
     private void CloseUdp(bool sendStopPacket)
     {
+        if (ownershipCoroutine != null) StopCoroutine(ownershipCoroutine);
+        ownershipCoroutine = null;
+        InvalidateCameraControl();
         poseSenderActive = false;
         if (sendStopPacket && transmissionEnabled)
         {
@@ -1325,6 +1275,8 @@ public class UdpPoseSender : MonoBehaviour
 
         if (!enabled)
         {
+            sourceEpoch++;
+            InvalidateCameraControl();
             poseSenderActive = false;
             SendPosePacket(Time.realtimeSinceStartupAsDouble, true);
             SendReleaseRequest();

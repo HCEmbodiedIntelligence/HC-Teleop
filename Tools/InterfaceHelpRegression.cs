@@ -22,8 +22,13 @@ public static class InterfaceHelpRegression
         {
             AppDomain.CurrentDomain.AssemblyResolve += (sender, eventArgs) =>
             {
-                string path = Path.Combine(args[1], new AssemblyName(eventArgs.Name).Name + ".dll");
-                return File.Exists(path) ? Assembly.LoadFrom(path) : null;
+                foreach (string directory in new[] { args[1], Path.GetDirectoryName(args[0]),
+                    Path.Combine(Directory.GetCurrentDirectory(), "Library", "ScriptAssemblies") })
+                {
+                    string path = Path.Combine(directory, new AssemblyName(eventArgs.Name).Name + ".dll");
+                    if (File.Exists(path)) return Assembly.LoadFrom(path);
+                }
+                return null;
             };
             Assembly project = Assembly.LoadFrom(args[0]);
             visibilityType = project.GetType("InterfaceHelpVisibility", true);
@@ -34,6 +39,7 @@ public static class InterfaceHelpRegression
             CheckExplicitCloseSuppression();
             CheckResetForFocusAndGlobalHide();
             CheckEmergencyAndGripAccess();
+            CheckBatteryColors(project);
             Console.WriteLine("PASS: " + assertions + " help-visibility assertions");
             return 0;
         }
@@ -175,11 +181,14 @@ public static class InterfaceHelpRegression
         Enter(state, 70);
         Call(state, "TogglePin");
         Call(state, "SetAccess", true, true, true, true);
-        Expect(state, false, false, "grip press immediately closes pinned help");
+        Expect(state, true, true, "grip press preserves explicitly pinned help");
         Call(state, "TogglePin");
+        Expect(state, true, true, "grip prevents question clicks from cancelling pin while dragging");
         Enter(state, 71);
         Call(state, "SetAccess", true, false, true, true);
-        Expect(state, false, false, "grip release cannot restore stale hover or pin");
+        Expect(state, true, true, "grip release retains pin after dragging");
+        Call(state, "TogglePin");
+        Expect(state, false, false, "after releasing grip a second trigger click closes pin");
         Enter(state, 71);
         Expect(state, true, false, "fresh hover after grip release opens help");
         Call(state, "TogglePin");
@@ -202,7 +211,35 @@ public static class InterfaceHelpRegression
         Call(state, "SetAccess", false, false, true, false);
         Expect(state, true, true, "safety resume while UDP remains off keeps help available");
         Call(state, "SetAccess", false, true, true, false);
-        Expect(state, false, false, "grip still closes help with UDP off");
+        Expect(state, true, true, "UDP-off pinned help also survives dragging");
+        Call(state, "SetAccess", false, true, false, false);
+        Expect(state, false, false, "global hide clears pin even during dragging");
+        Call(state, "SetAccess", false, false, true, false);
+        Enter(state, 72);
+        Expect(state, true, false, "fresh unpinned hover opens help");
+        Call(state, "SetAccess", false, true, true, false);
+        Expect(state, false, false, "grip still closes unpinned hover help");
+        Call(state, "SetAccess", false, false, true, false);
+        Expect(state, false, false, "grip release cannot resurrect unpinned hover");
+    }
+
+    private static void CheckBatteryColors(Assembly project)
+    {
+        MethodInfo method = project.GetType("UdpTransmissionButton", true).GetMethod("GetHeadsetBatteryColor",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Type status = method.GetParameters()[2].ParameterType;
+        foreach (string charging in new[] { "Discharging", "Charging" })
+        foreach (int percent in new[] { 0, 10, 11, 20, 21, 100 })
+        {
+            string expected = percent <= 10 ? "#FF3852" : percent <= 20 ? "#FFBC29" :
+                charging == "Charging" ? "#0FF08A" : "#ABBFDB";
+            string actual = (string)method.Invoke(null, new object[] { true, percent, Enum.Parse(status, charging) });
+            if (actual != expected) throw new Exception("FAIL: battery threshold " + percent + " / " + charging);
+            assertions++;
+        }
+        string unknown = (string)method.Invoke(null, new object[] { false, 0, Enum.Parse(status, "Unknown") });
+        if (unknown != "#ABBFDB") throw new Exception("FAIL: unknown battery must not display red");
+        assertions++;
     }
 
     private static object NewState()

@@ -207,6 +207,8 @@ public class MultiCameraDisplayManager : MonoBehaviour
             {
                 request.timeout = 5;
                 yield return request.SendWebRequest();
+                if (poseSender == null || poseSender.ReceiverIpAddress != serverIp)
+                    continue;
                 if (request.result == UnityWebRequest.Result.Success)
                 {
                     CameraStatusResponse response = null;

@@ -11,14 +11,22 @@ public sealed class InterfaceHelpVisibility
 {
     private readonly HashSet<int> buttonPointers = new HashSet<int>();
     private bool dismissed;
+    private bool contextAllowed;
     public bool Allowed { get; private set; }
-    public bool Visible => Allowed && (Pinned || (!dismissed && buttonPointers.Count > 0));
+    public bool Visible => contextAllowed && (Pinned || (Allowed && !dismissed && buttonPointers.Count > 0));
     public bool Pinned { get; private set; }
 
     public void SetAccess(bool emergencyStopped, bool gripHeld, bool interfaceVisible, bool transmissionEnabled)
     {
-        Allowed = (emergencyStopped || !transmissionEnabled) && !gripHeld && interfaceVisible;
-        if (!Allowed) Reset();
+        contextAllowed = (emergencyStopped || !transmissionEnabled) && interfaceVisible;
+        Allowed = contextAllowed && !gripHeld;
+        if (!contextAllowed) Reset();
+        else if (gripHeld)
+        {
+            // Dragging cannot open new help, but an explicit trigger pin survives.
+            buttonPointers.Clear();
+            dismissed = false;
+        }
     }
 
     public void Enter(int pointerId)
@@ -104,7 +112,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
             new Entry("左右扳机 · 夹爪", "控制对应夹爪开合。\n扳机同时也用于界面点击。"),
             new Entry("左侧握把 · 底盘 / 腰部", "配合摇杆 / 头部动作控制底盘、\n腰部；仅适用于支持该功能的机器人。"),
             new Entry("摇杆向外拨 · 机器人回零", "左杆向左、右杆向右：机器人回零。\n向下按两摇杆才是界面显隐。"),
-            new Entry("查看说明期间", "急停或关闭 UDP 时可查看说明。\n按下任一握把或恢复遥操作会收起。")
+            new Entry("查看说明期间", "扳机固定后，握把拖动仍保留说明。\n未固定时按握把会收起；恢复遥操作收起。")
         }
     };
 
@@ -262,7 +270,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
         if (popup == null) return;
         if (popup.gameObject.activeSelf != visibility.Visible) popup.gameObject.SetActive(visibility.Visible);
         footer.text = visibility.Pinned
-            ? "已固定 · 可切换分类阅读 · 再次点击右上角问号关闭"
+            ? "已固定 · 握把拖动保留 · 再次点击右上角问号关闭"
             : "指向问号查看 · 离开问号关闭 · 点击问号固定后可切换分类";
     }
 

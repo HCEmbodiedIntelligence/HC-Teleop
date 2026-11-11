@@ -8,13 +8,15 @@ using UnityEngine;
 using UnityEngine.Networking;
 using UnityEngine.UI;
 
-public class CameraFrameViewer : MonoBehaviour
+public partial class CameraFrameViewer : MonoBehaviour
 {
     [Serializable]
     private class SessionDescriptionJson
     {
         public string sdp;
         public string type;
+        // Optional on older middleware; absent means receiver telemetry stays disabled.
+        public string telemetry_session_id;
     }
 
     [Header("自动发现与信令")]
@@ -645,13 +647,18 @@ public class CameraFrameViewer : MonoBehaviour
         RTCRtpTransceiver transceiver =
             peerConnection.AddTransceiver(TrackKind.Video, init);
 
-        // 优先支持 H.264，同时保留 VP8 作为安全后备
+        // Keep native receiver repair codecs; advertising RED/ULPFEC does not itself enable FEC.
+        // The server may select VP8 for experimental ULPFEC; H.264 stays the normal preference.
         RTCRtpCodecCapability[] preferredCodecs =
-            RTCRtpSender.GetCapabilities(TrackKind.Video).codecs
+            RTCRtpReceiver.GetCapabilities(TrackKind.Video).codecs
                 .Where(codec =>
                     string.Equals(codec.mimeType, "video/H264", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(codec.mimeType, "video/VP8", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(codec => string.Equals(codec.mimeType, "video/H264", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    string.Equals(codec.mimeType, "video/VP8", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(codec.mimeType, "video/rtx", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(codec.mimeType, "video/red", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(codec.mimeType, "video/ulpfec", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(codec => string.Equals(codec.mimeType, "video/H264", StringComparison.OrdinalIgnoreCase) ? 0 :
+                    string.Equals(codec.mimeType, "video/VP8", StringComparison.OrdinalIgnoreCase) ? 1 : 2)
                 .ToArray();
 
         if (preferredCodecs.Length > 0)
@@ -767,6 +774,7 @@ public class CameraFrameViewer : MonoBehaviour
             yield break;
         }
 
+        BeginReceiverTelemetry(peerConnection, serverIp, activeConnectionStreamId, answerJson.telemetry_session_id);
         connectionState = "等待视频帧";
     }
 
@@ -867,6 +875,8 @@ public class CameraFrameViewer : MonoBehaviour
                     continue;
                 }
 
+                // Capture defined native stats before legacy UI property fallbacks.
+                QueueReceiverTelemetry(inbound, statsConnection);
                 statsWarningLogged = false;
                 float now = Time.realtimeSinceStartup;
                 ulong currentBytes = inbound.bytesReceived;
@@ -1223,6 +1233,7 @@ public class CameraFrameViewer : MonoBehaviour
 
     private void ClosePeerConnection(bool clearTexture = false)
     {
+        ResetReceiverTelemetry();
         if (signalingRequest != null)
         {
             try { signalingRequest.Abort(); }

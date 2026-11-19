@@ -195,6 +195,7 @@ public partial class UdpPoseSender : MonoBehaviour
     public bool ReplayRequiresReset { get; private set; }
     public string LastReplayMessage { get; private set; }
     private readonly MiddlewareSafetyState safetyState = new MiddlewareSafetyState();
+    private TeleopVoicePrompts voicePrompts;
     public bool IsEmergencyStopped => safetyState.IsEmergencyStopped;
     public string EmergencyStopReason => safetyState.EmergencyStopReason;
     public string EmergencyStopMessage => safetyState.EmergencyStopMessage;
@@ -593,8 +594,13 @@ public partial class UdpPoseSender : MonoBehaviour
 
         if (eventKind == "safety_stop" || eventKind == "safety_resume")
         {
+            bool wasStopped = IsEmergencyStopped;
             if (!safetyState.Apply(evt))
                 return;
+            if (IsEmergencyStopped && !wasStopped)
+                Announce(TeleopVoicePrompts.Cue.TeleopExited);
+            else if (wasStopped && !IsEmergencyStopped && transmissionEnabled)
+                Announce(TeleopVoicePrompts.Cue.TeleopStarted);
             // Keep sending input so A can reach the middleware's resume handler.
             // A local transmission toggle or recovered tracking must not clear this state.
             if (!IsEmergencyStopped && transmissionEnabled)
@@ -660,8 +666,17 @@ public partial class UdpPoseSender : MonoBehaviour
                 ActiveRecordingFile = null;
             }
             RecordingStateChanged?.Invoke(IsRecording, LastRecordingMessage);
+            if (wasRecording != IsRecording && string.IsNullOrEmpty(payload.error))
+                Announce(IsRecording ? TeleopVoicePrompts.Cue.RecordingStarted : TeleopVoicePrompts.Cue.RecordingExited);
         }
         NetworkStatusChanged?.Invoke();
+    }
+
+    private void Announce(TeleopVoicePrompts.Cue cue)
+    {
+        if (voicePrompts == null)
+            voicePrompts = gameObject.AddComponent<TeleopVoicePrompts>();
+        voicePrompts.Announce(cue);
     }
 
     private void SendPosePacket(double timestamp, bool forceInvalidFlags = false)
@@ -1298,6 +1313,8 @@ public partial class UdpPoseSender : MonoBehaviour
         }
 
         Debug.Log(transmissionEnabled ? "UDP transmission enabled" : "UDP transmission disabled");
+        if (!IsEmergencyStopped)
+            Announce(transmissionEnabled ? TeleopVoicePrompts.Cue.TeleopStarted : TeleopVoicePrompts.Cue.TeleopExited);
         TransmissionStateChanged?.Invoke(transmissionEnabled);
         NetworkStatusChanged?.Invoke();
     }

@@ -153,6 +153,13 @@ public class UdpTransmissionButton : MonoBehaviour
         if (legacyTag != null)
             legacyTag.gameObject.SetActive(false);
 
+        // Keep the build version below the title and above the first toolbar row.
+        TMP_Text appVersion = Label(titleObj.transform, "AppVersion", "v" + Application.version,
+            new Vector2(0f, -27f), new Vector2(165f, 18f), 14f,
+            TextAlignmentOptions.MidlineLeft, FontStyles.Normal);
+        appVersion.color = colorTextMuted;
+        appVersion.overflowMode = TextOverflowModes.Ellipsis;
+
         ConfigureStatusText(panel);
 
         // Top row: device information ends 15 px before the help hit area.

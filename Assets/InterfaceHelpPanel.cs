@@ -83,7 +83,7 @@ public sealed class InterfaceHelpPanel : MonoBehaviour
             new Entry("UDP · 数据发送开关", "点击切换发送状态，也可用 A / B。\n开启后等待自动发现中间件。"),
             new Entry("CAM · 全部相机", "统一开启或关闭全部相机窗口。\n关闭相机会停止对应视频连接。"),
             new Entry("REC · 录制状态", "显示录制状态与时长。\n使用左手 X / Y 开始或停止录制。"),
-            new Entry("XYZ · 坐标标记", "显示或隐藏手柄的 XYZ 坐标标记。\n不会关闭手柄追踪。"),
+            new Entry("XYZ · 坐标标记", "点击或同时按 Y+B 切换坐标标记。\nUDP 开启时，B 仍会停发。"),
             new Entry("复位 · 恢复默认布局", "点击后将面板移回眼前，\n并恢复相机窗口的默认大小。"),
             new Entry("相机窗口 · 单路开关", "点击头部、俯视或腕部相机按钮，\n单独显示 / 隐藏；数字为帧率。")
         },

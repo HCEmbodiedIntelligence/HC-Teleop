@@ -18,6 +18,7 @@ public sealed class ControllerVisualState : MonoBehaviour
     private bool applicationFocused = true;
     private bool applicationPaused;
     private bool systemButtonHeld;
+    private bool markerShortcutArmed;
 
     public bool MarkersRequested => markersRequested;
 
@@ -49,6 +50,7 @@ public sealed class ControllerVisualState : MonoBehaviour
         if (menuPressed)
         {
             systemButtonHeld = true;
+            markerShortcutArmed = false;
             HideAllVisuals();
             return;
         }
@@ -56,12 +58,14 @@ public sealed class ControllerVisualState : MonoBehaviour
         if (systemButtonHeld)
             systemButtonHeld = false;
 
+        ProcessMarkerShortcut();
         ApplyVisualState();
     }
 
     private void OnApplicationFocus(bool hasFocus)
     {
         applicationFocused = hasFocus;
+        markerShortcutArmed = false;
         if (!hasFocus)
             HideAllVisuals();
     }
@@ -69,8 +73,42 @@ public sealed class ControllerVisualState : MonoBehaviour
     private void OnApplicationPause(bool pauseStatus)
     {
         applicationPaused = pauseStatus;
+        markerShortcutArmed = false;
         if (pauseStatus)
             HideAllVisuals();
+    }
+
+    private void OnDisable()
+    {
+        markerShortcutArmed = false;
+    }
+
+    private void ProcessMarkerShortcut()
+    {
+        if (!applicationFocused || applicationPaused ||
+            !TryReadMarkerShortcutButton(XRNode.LeftHand, out bool y) ||
+            !TryReadMarkerShortcutButton(XRNode.RightHand, out bool b))
+        {
+            markerShortcutArmed = false;
+            return;
+        }
+
+        if (!y && !b)
+            markerShortcutArmed = true;
+
+        if (markerShortcutArmed && y && b)
+        {
+            markerShortcutArmed = false;
+            SetMarkersVisible(!MarkersRequested);
+        }
+    }
+
+    private static bool TryReadMarkerShortcutButton(XRNode node, out bool pressed)
+    {
+        pressed = false;
+        InputDevice device = InputDevices.GetDeviceAtXRNode(node);
+        return IsTracked(device) &&
+            device.TryGetFeatureValue(CommonUsages.secondaryButton, out pressed);
     }
 
     private void TryConfigureFromPoseReader()
@@ -176,9 +214,10 @@ public sealed class ControllerVisualState : MonoBehaviour
             rayVisual.enabled = visible;
     }
 
-    private static bool IsTracked(XRNode node)
+    private static bool IsTracked(XRNode node) => IsTracked(InputDevices.GetDeviceAtXRNode(node));
+
+    private static bool IsTracked(InputDevice device)
     {
-        InputDevice device = InputDevices.GetDeviceAtXRNode(node);
         if (!device.isValid)
             return false;
 

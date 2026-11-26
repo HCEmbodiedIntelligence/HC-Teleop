@@ -33,7 +33,7 @@ MonoBehaviour:
   spatialAnchor: 0
   sceneCapture: 0
   sharedAnchor: 0
-  spatialMesh: 0
+  spatialMesh: 1
   planeDetection: 0
   secureMR: 0
   meshLod: 0
@@ -47,7 +47,7 @@ MonoBehaviour:
   lightEstimation: 0
   lightEstimationTextureResolution: 0
   arFoundation: 0
-  mrSafeguard: 0
+  mrSafeguard: 1
   enableRecommendMSAA: 1
   recommendSubsamping: 0
   recommendMSAA: 1
